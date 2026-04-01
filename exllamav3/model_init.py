@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
-from .cache import CacheLayer_fp16, CacheLayer_quant
+from .cache import CacheLayer_fp16, CacheLayer_quant, CacheLayer_turboquant
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
 import yaml
@@ -75,6 +75,8 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+        parser.add_argument("-tq", "--turboquant", type = str, help = "Use TurboQuant KV cache. Specify 'turboquant25' or 'turboquant35'")
+        parser.add_argument("-tqm", "--turboquant_metadata", type = str, help = "Path to TurboQuant calibration metadata JSON")
 
 
 def get_arg_sampler(args):
@@ -170,7 +172,24 @@ def init(
 
     # Cache
     if "cache_size" in vars(args):
-        if args.cache_quant is not None:
+        tq_arg = getattr(args, "turboquant", None)
+        if tq_arg is not None:
+            # Parse "k_bits" or "k_bits,v_bits"
+            tq_split = [int(b) for b in tq_arg.split(",")]
+            if len(tq_split) == 1:
+                tq_k_bits = tq_v_bits = tq_split[0]
+            elif len(tq_split) == 2:
+                tq_k_bits, tq_v_bits = tq_split
+            else:
+                raise ValueError("Specify either one or two bitrates for TurboQuant (e.g. -tq 4 or -tq 4,3)")
+            cache = Cache(
+                model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_turboquant,
+                k_bits = tq_k_bits,
+                v_bits = tq_v_bits,
+            )
+        elif args.cache_quant is not None:
             split = [int(bits) for bits in args.cache_quant.split(",")]
             if len(split) == 1:
                 k_bits = v_bits = split[0]

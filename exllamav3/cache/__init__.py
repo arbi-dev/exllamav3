@@ -1,4 +1,5 @@
 from .cache import Cache, CacheLayer
 from .fp16 import CacheLayer_fp16
 from .quant import CacheLayer_quant
+from .turboquant import CacheLayer_turboquant
 from .recurrent import RecurrentCache, CacheableState
