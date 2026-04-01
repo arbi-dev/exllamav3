@@ -1,8 +1,8 @@
 """
 TurboQuant KV cache layer for exllamav3.
 
-PolarQuant quantization with separate norm tensors, no outlier groups,
-no calibration metadata. Deterministic from seed.
+PolarQuant quantization with separate norm tensors. Deterministic from seed.
+Pre-allocated decompress buffers bounded by actual usage, not total cache.
 
 Adapted from turboquant-vllm (https://github.com/varjoranta/turboquant-vllm).
 """
@@ -83,7 +83,7 @@ class CacheLayer_turboquant(CacheLayer):
         self.v_norms = None
         self.device = None
 
-        # Codebook and rotation (allocated in alloc())
+        # Codebook and rotation
         self.k_centroids = None
         self.k_boundaries = None
         self.v_centroids = None
@@ -105,15 +105,15 @@ class CacheLayer_turboquant(CacheLayer):
         self.k_norms = torch.zeros(self.norms_shape, dtype=torch.float32, device=device)
         self.v_norms = torch.zeros(self.norms_shape, dtype=torch.float32, device=device)
 
-        # Compute codebooks
-        k_c, k_b = compute_codebook(self.k_bits, self.head_dim)
-        v_c, v_b = compute_codebook(self.v_bits, self.head_dim)
+        # Compute codebooks (use padded_dim for WHT-compatible distribution)
+        k_c, k_b = compute_codebook(self.k_bits, self.padded_head_dim)
+        v_c, v_b = compute_codebook(self.v_bits, self.padded_head_dim)
         self.k_centroids = torch.tensor(k_c, dtype=torch.float32, device=device)
         self.k_boundaries = torch.tensor(k_b, dtype=torch.float32, device=device)
         self.v_centroids = torch.tensor(v_c, dtype=torch.float32, device=device)
         self.v_boundaries = torch.tensor(v_b, dtype=torch.float32, device=device)
 
-        # WHT rotation signs (deterministic from seed)
+        # WHT rotation signs (generated at padded_dim)
         self.k_signs1, self.k_signs2 = generate_wht_signs(self.head_dim, self.seed + K_SEED_OFFSET)
         self.k_signs1 = self.k_signs1.to(device)
         self.k_signs2 = self.k_signs2.to(device)
@@ -139,7 +139,11 @@ class CacheLayer_turboquant(CacheLayer):
 
     @override
     def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor):
-        """Dequantize packed cache to FP16 for flash attention."""
+        """Dequantize packed cache to FP16 for flash attention.
+
+        Returns full-sized paged tensors as flash_attn_with_kvcache expects,
+        but only decompresses pages that contain actual tokens.
+        """
         k_out = torch.zeros(self.fp16_shape, dtype=torch.half, device=self.device)
         v_out = torch.zeros(self.fp16_shape, dtype=torch.half, device=self.device)
 
@@ -161,26 +165,52 @@ class CacheLayer_turboquant(CacheLayer):
         return k_out, v_out
 
     def _decode_python(self, k_out, v_out, cache_seqlens, block_table):
+        """Decompress only active pages using batched operations."""
         batch_size = cache_seqlens.shape[0]
+
+        # Collect unique active pages with their token counts
+        active_pages = {}  # page_idx -> max_tokens_in_page
         for b in range(batch_size):
             seq_len = cache_seqlens[b].item()
             if seq_len == 0:
                 continue
-            pages_needed = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-            for p in range(pages_needed):
+            for p in range((seq_len + PAGE_SIZE - 1) // PAGE_SIZE):
                 mapped_page = block_table[b, p].item()
                 tokens_in_page = min(PAGE_SIZE, seq_len - p * PAGE_SIZE)
-                T, H = tokens_in_page, self.num_kv_heads
+                active_pages[mapped_page] = max(
+                    active_pages.get(mapped_page, 0), tokens_in_page
+                )
 
-                k_packed = self.cache_k[mapped_page, :T]
-                k_indices = unpack_indices(k_packed.reshape(T * H, self.k_packed_dim), self.k_bits, self.head_dim)
-                k_fp16 = dequantize_pq(k_indices.reshape(T * H, self.head_dim), self.k_norms[mapped_page, :T].reshape(T * H), self.k_signs1, self.k_signs2, self.k_centroids)
-                k_out[mapped_page, :T] = k_fp16.reshape(T, H, self.head_dim)
+        if not active_pages:
+            return
 
-                v_packed = self.cache_v[mapped_page, :T]
-                v_indices = unpack_indices(v_packed.reshape(T * H, self.v_packed_dim), self.v_bits, self.head_dim)
-                v_fp16 = dequantize_pq(v_indices.reshape(T * H, self.head_dim), self.v_norms[mapped_page, :T].reshape(T * H), self.v_signs1, self.v_signs2, self.v_centroids)
-                v_out[mapped_page, :T] = v_fp16.reshape(T, H, self.head_dim)
+        H, D = self.num_kv_heads, self.head_dim
+
+        # Batch decompress per page
+        for pg, T in active_pages.items():
+            # K decompress
+            k_packed = self.cache_k[pg, :T]  # (T, H, k_pd)
+            k_flat = k_packed.reshape(T * H, self.k_packed_dim)
+            k_indices = unpack_indices(k_flat, self.k_bits, self.head_dim)
+            k_norms = self.k_norms[pg, :T].reshape(T * H)
+            k_fp16 = dequantize_pq(
+                k_indices, k_norms,
+                self.k_signs1, self.k_signs2, self.k_centroids,
+                head_dim=self.head_dim,
+            )
+            k_out[pg, :T] = k_fp16.reshape(T, H, D)
+
+            # V decompress
+            v_packed = self.cache_v[pg, :T]
+            v_flat = v_packed.reshape(T * H, self.v_packed_dim)
+            v_indices = unpack_indices(v_flat, self.v_bits, self.head_dim)
+            v_norms = self.v_norms[pg, :T].reshape(T * H)
+            v_fp16 = dequantize_pq(
+                v_indices, v_norms,
+                self.v_signs1, self.v_signs2, self.v_centroids,
+                head_dim=self.head_dim,
+            )
+            v_out[pg, :T] = v_fp16.reshape(T, H, D)
 
     @override
     def update_kv(
@@ -191,7 +221,6 @@ class CacheLayer_turboquant(CacheLayer):
         v: torch.Tensor,
         length: int,
     ):
-        """Quantize FP16 K/V and store packed indices + norms."""
         if _has_cuda_ext and self.device.type == "cuda":
             ext.turboquant_encode_paged(
                 k, v,
@@ -219,13 +248,23 @@ class CacheLayer_turboquant(CacheLayer):
                 mapped_page = block_table[b, page_idx].item()
 
                 k_vec = k[mapped_page, token_in_page]
-                k_indices, k_n = quantize_pq(k_vec, self.k_signs1, self.k_signs2, self.k_centroids, self.k_boundaries)
-                self.cache_k[mapped_page, token_in_page] = pack_indices(k_indices, self.k_bits, self.head_dim)
+                k_indices, k_n = quantize_pq(
+                    k_vec, self.k_signs1, self.k_signs2,
+                    self.k_centroids, self.k_boundaries,
+                )
+                self.cache_k[mapped_page, token_in_page] = pack_indices(
+                    k_indices, self.k_bits, self.head_dim
+                )
                 self.k_norms[mapped_page, token_in_page] = k_n
 
                 v_vec = v[mapped_page, token_in_page]
-                v_indices, v_n = quantize_pq(v_vec, self.v_signs1, self.v_signs2, self.v_centroids, self.v_boundaries)
-                self.cache_v[mapped_page, token_in_page] = pack_indices(v_indices, self.v_bits, self.head_dim)
+                v_indices, v_n = quantize_pq(
+                    v_vec, self.v_signs1, self.v_signs2,
+                    self.v_centroids, self.v_boundaries,
+                )
+                self.cache_v[mapped_page, token_in_page] = pack_indices(
+                    v_indices, self.v_bits, self.head_dim
+                )
                 self.v_norms[mapped_page, token_in_page] = v_n
 
     @override
@@ -244,7 +283,7 @@ class CacheLayer_turboquant(CacheLayer):
         return (
             np.prod(self.k_cache_shape)
             + np.prod(self.v_cache_shape)
-            + 2 * np.prod(self.norms_shape) * 4  # fp32 norms
+            + 2 * np.prod(self.norms_shape) * 4
         )
 
     @override

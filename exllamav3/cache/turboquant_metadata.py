@@ -2,8 +2,8 @@
 PolarQuant KV cache quantization utilities for exllamav3.
 
 Algorithm: Lloyd's codebook quantization on WHT-rotated unit vectors.
-  encode: x → normalize → D1·H·D2 rotation → searchsorted → packed indices + norm
-  decode: unpack → centroid lookup → D2·H·D1 inverse rotation → scale by norm
+  encode: x -> normalize -> D1*H*D2 rotation -> searchsorted -> packed indices + norm
+  decode: unpack -> centroid lookup -> D2*H*D1 inverse rotation -> scale by norm
 
 All dimensions treated uniformly. Norms stored separately as fp32.
 Codebook and rotation signs are deterministic from seed.
@@ -25,7 +25,6 @@ V_SEED_OFFSET = 500
 
 
 def _next_pow2(n: int) -> int:
-    """Round up to next power of 2."""
     if n <= 0:
         return 1
     return 1 << (n - 1).bit_length()
@@ -34,10 +33,7 @@ def _next_pow2(n: int) -> int:
 # ── Codebook (Lloyd's algorithm for Gaussian) ────────────────────────────────
 
 def compute_codebook(bit_width: int, head_dim: int) -> tuple[list[float], list[float]]:
-    """Compute optimal centroids and boundaries for N(0, 1/sqrt(d)).
-
-    Returns (centroids, boundaries) as sorted lists.
-    """
+    """Compute optimal centroids and boundaries for N(0, 1/sqrt(d))."""
     from scipy import stats
 
     n = 1 << bit_width
@@ -80,32 +76,31 @@ def compute_codebook(bit_width: int, head_dim: int) -> tuple[list[float], list[f
 
 # ── WHT rotation signs ───────────────────────────────────────────────────────
 
-def generate_wht_signs(
-    head_dim: int, seed: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate deterministic WHT rotation sign vectors (±1, float32)."""
-    gen = torch.Generator().manual_seed(seed)
-    signs1 = (torch.randint(0, 2, (head_dim,), generator=gen) * 2 - 1).float()
-    signs2 = (torch.randint(0, 2, (head_dim,), generator=gen) * 2 - 1).float()
-    return signs1, signs2
+def generate_wht_signs(head_dim: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate deterministic WHT rotation signs at padded dimension."""
+    pd = _next_pow2(head_dim)
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    s1 = (torch.randint(0, 2, (pd,), generator=gen, device="cpu") * 2 - 1).float()
+    s2 = (torch.randint(0, 2, (pd,), generator=gen, device="cpu") * 2 - 1).float()
+    return s1, s2
 
 
 # ── Packed dimension computation ──────────────────────────────────────────────
 
 def padded_dim(head_dim: int) -> int:
-    """Head dim padded to next power of 2 for WHT."""
     return _next_pow2(head_dim)
 
 
 def packed_dim(bit_width: int, head_dim: int) -> int:
-    """Bytes per vector in packed cache for a given bit width.
-    Uses padded dimension since WHT requires power of 2."""
+    """Bytes per vector in packed cache."""
     pd = padded_dim(head_dim)
     if bit_width == 4:
         return pd // 2
+    if bit_width == 3:
+        return (pd * 3 + 7) // 8  # proper bitstream: 3 bits per index
     if bit_width == 2:
         return pd // 4
-    return pd  # 3-bit: 1 byte per index
+    return pd
 
 
 # ── Walsh-Hadamard Transform ─────────────────────────────────────────────────
@@ -116,122 +111,107 @@ def _fwht_pow2(x: torch.Tensor) -> torch.Tensor:
     out = x.clone()
     h = 1
     while h < n:
-        out_view = out.reshape(*out.shape[:-1], -1, 2 * h)
-        left = out_view[..., :h].clone()
-        right = out_view[..., h:].clone()
-        out_view[..., :h] = left + right
-        out_view[..., h:] = left - right
+        v = out.reshape(*out.shape[:-1], -1, 2 * h)
+        left = v[..., :h].clone()
+        right = v[..., h:].clone()
+        v[..., :h] = left + right
+        v[..., h:] = left - right
         h <<= 1
     return out * (1.0 / math.sqrt(n))
 
 
-# ── Quantize / Dequantize (Python reference, also used as CPU fallback) ──────
+# ── Quantize / Dequantize ────────────────────────────────────────────────────
 
-def quantize_pq(
-    x: torch.Tensor,
-    signs1: torch.Tensor,
-    signs2: torch.Tensor,
-    centroids: torch.Tensor,
-    boundaries: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """PolarQuant encode: vectors → (indices, norms).
-
-    x: (..., head_dim) — head_dim may be non-power-of-2 (zero-padded internally)
-    Returns: (indices (..., padded_dim) uint8, norms (...,) float32)
-    """
+def quantize_pq(x, signs1, signs2, centroids, boundaries):
+    """PolarQuant encode. x: (..., head_dim). Returns (indices, norms)."""
     head_dim = x.shape[-1]
     pd = padded_dim(head_dim)
     x_f32 = x.to(torch.float32)
-
-    # Pad to power of 2 if needed
     if pd != head_dim:
         x_f32 = torch.nn.functional.pad(x_f32, (0, pd - head_dim))
-
     norms = x_f32.norm(dim=-1, keepdim=True).clamp_min(1e-10)
     unit = x_f32 / norms
-
     rotated = unit * signs1
     rotated = _fwht_pow2(rotated)
     rotated = rotated * signs2
-
     indices = torch.searchsorted(boundaries, rotated).clamp(0, centroids.shape[0] - 1)
     return indices.to(torch.uint8), norms.squeeze(-1)
 
 
-def dequantize_pq(
-    indices: torch.Tensor,
-    norms: torch.Tensor,
-    signs1: torch.Tensor,
-    signs2: torch.Tensor,
-    centroids: torch.Tensor,
-    head_dim: int | None = None,
-) -> torch.Tensor:
-    """PolarQuant decode: (indices, norms) → FP16 vectors.
-
-    indices: (..., padded_dim) uint8
-    norms: (...,) float32
-    head_dim: original (unpadded) dimension, or None if no padding
-    Returns: (..., head_dim) float16
-    """
+def dequantize_pq(indices, norms, signs1, signs2, centroids, head_dim=None):
+    """PolarQuant decode. Returns (..., head_dim) float16."""
     values = centroids[indices.long()]
-
     values = values * signs2
     values = _fwht_pow2(values)
     values = values * signs1
-
     values = values * norms.unsqueeze(-1)
-
-    # Unpad if needed
     if head_dim is not None and values.shape[-1] != head_dim:
         values = values[..., :head_dim]
-
     return values.to(torch.float16)
 
 
-# ── Bit packing (matches CUDA kernel layout exactly) ─────────────────────────
+# ── Bit packing ──────────────────────────────────────────────────────────────
 
 def pack_indices(indices: torch.Tensor, bit_width: int, head_dim: int) -> torch.Tensor:
-    """Pack codebook indices into bytes."""
+    """Pack codebook indices into bytes. Matches CUDA kernel layout."""
+    pd = padded_dim(head_dim)
     shape = indices.shape[:-1]
-    flat = indices.reshape(-1, head_dim).to(torch.int32)
-    pd = packed_dim(bit_width, head_dim)
-    out = torch.zeros(flat.shape[0], pd, dtype=torch.uint8, device=indices.device)
+    flat = indices.reshape(-1, pd).to(torch.int32)
+    pd_out = packed_dim(bit_width, head_dim)
+    out = torch.zeros(flat.shape[0], pd_out, dtype=torch.uint8, device=indices.device)
 
     if bit_width == 4:
-        for i in range(head_dim // 2):
+        for i in range(pd // 2):
             lo = flat[:, i * 2] & 0xF
             hi = flat[:, i * 2 + 1] & 0xF
             out[:, i] = (lo | (hi << 4)).to(torch.uint8)
+    elif bit_width == 3:
+        # Proper 3-bit bitstream packing
+        bit_pos = 0
+        for d in range(pd):
+            val = flat[:, d] & 0x7
+            for b in range(3):
+                byte_idx = bit_pos // 8
+                bit_idx = bit_pos % 8
+                out[:, byte_idx] |= (((val >> b) & 1) << bit_idx).to(torch.uint8)
+                bit_pos += 1
     elif bit_width == 2:
-        for i in range(head_dim // 4):
+        for i in range(pd // 4):
             byte_val = torch.zeros(flat.shape[0], dtype=torch.int32, device=indices.device)
             for j in range(4):
                 byte_val |= (flat[:, i * 4 + j] & 0x3) << (j * 2)
             out[:, i] = byte_val.to(torch.uint8)
-    else:
-        out = flat.to(torch.uint8)
 
-    return out.reshape(*shape, pd)
+    return out.reshape(*shape, pd_out)
 
 
 def unpack_indices(packed: torch.Tensor, bit_width: int, head_dim: int) -> torch.Tensor:
     """Unpack bytes to codebook indices. Inverse of pack_indices."""
+    pd = padded_dim(head_dim)
+    pd_in = packed_dim(bit_width, head_dim)
     shape = packed.shape[:-1]
-    pd = packed_dim(bit_width, head_dim)
-    flat = packed.reshape(-1, pd).to(torch.int32)
-    out = torch.zeros(flat.shape[0], head_dim, dtype=torch.int32, device=packed.device)
+    flat = packed.reshape(-1, pd_in).to(torch.int32)
+    out = torch.zeros(flat.shape[0], pd, dtype=torch.int32, device=packed.device)
 
     if bit_width == 4:
-        for i in range(head_dim // 2):
+        for i in range(pd // 2):
             byte_val = flat[:, i]
             out[:, i * 2] = byte_val & 0xF
             out[:, i * 2 + 1] = (byte_val >> 4) & 0xF
+    elif bit_width == 3:
+        bit_pos = 0
+        for d in range(pd):
+            val = torch.zeros(flat.shape[0], dtype=torch.int32, device=packed.device)
+            for b in range(3):
+                byte_idx = bit_pos // 8
+                bit_idx = bit_pos % 8
+                val |= ((flat[:, byte_idx] >> bit_idx) & 1) << b
+                bit_pos += 1
+            out[:, d] = val
     elif bit_width == 2:
-        for i in range(head_dim // 4):
+        for i in range(pd // 4):
             byte_val = flat[:, i]
             for j in range(4):
                 out[:, i * 4 + j] = (byte_val >> (j * 2)) & 0x3
-    else:
-        out = flat
 
-    return out.reshape(*shape, head_dim).to(torch.uint8)
+    return out.reshape(*shape, pd).to(torch.uint8)
