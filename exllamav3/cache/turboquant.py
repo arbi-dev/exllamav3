@@ -18,6 +18,7 @@ from .turboquant_metadata import (
     compute_codebook,
     generate_wht_signs,
     packed_dim,
+    padded_dim,
     quantize_pq,
     dequantize_pq,
     pack_indices,
@@ -57,13 +58,12 @@ class CacheLayer_turboquant(CacheLayer):
             f"max_num_tokens must be a multiple of {PAGE_SIZE}"
         assert 2 <= k_bits <= 4 and 2 <= v_bits <= 4, \
             "bit width must be 2, 3, or 4"
-        assert attention.head_dim > 0 and (attention.head_dim & (attention.head_dim - 1)) == 0, \
-            "head_dim must be power of 2"
 
         self.k_bits = k_bits
         self.v_bits = v_bits
         self.seed = seed
         self.head_dim = attention.head_dim
+        self.padded_head_dim = padded_dim(attention.head_dim)
         self.num_kv_heads = attention.num_kv_heads
         self.num_pages = max_num_tokens // PAGE_SIZE
 

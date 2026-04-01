@@ -24,6 +24,13 @@ K_SEED_OFFSET = 0
 V_SEED_OFFSET = 500
 
 
+def _next_pow2(n: int) -> int:
+    """Round up to next power of 2."""
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 # ── Codebook (Lloyd's algorithm for Gaussian) ────────────────────────────────
 
 def compute_codebook(bit_width: int, head_dim: int) -> tuple[list[float], list[float]]:
@@ -85,13 +92,20 @@ def generate_wht_signs(
 
 # ── Packed dimension computation ──────────────────────────────────────────────
 
+def padded_dim(head_dim: int) -> int:
+    """Head dim padded to next power of 2 for WHT."""
+    return _next_pow2(head_dim)
+
+
 def packed_dim(bit_width: int, head_dim: int) -> int:
-    """Bytes per vector in packed cache for a given bit width."""
+    """Bytes per vector in packed cache for a given bit width.
+    Uses padded dimension since WHT requires power of 2."""
+    pd = padded_dim(head_dim)
     if bit_width == 4:
-        return head_dim // 2
+        return pd // 2
     if bit_width == 2:
-        return head_dim // 4
-    return head_dim  # 3-bit: 1 byte per index
+        return pd // 4
+    return pd  # 3-bit: 1 byte per index
 
 
 # ── Walsh-Hadamard Transform ─────────────────────────────────────────────────
@@ -122,10 +136,17 @@ def quantize_pq(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """PolarQuant encode: vectors → (indices, norms).
 
-    x: (..., head_dim)
-    Returns: (indices (..., head_dim) uint8, norms (...,) float32)
+    x: (..., head_dim) — head_dim may be non-power-of-2 (zero-padded internally)
+    Returns: (indices (..., padded_dim) uint8, norms (...,) float32)
     """
+    head_dim = x.shape[-1]
+    pd = padded_dim(head_dim)
     x_f32 = x.to(torch.float32)
+
+    # Pad to power of 2 if needed
+    if pd != head_dim:
+        x_f32 = torch.nn.functional.pad(x_f32, (0, pd - head_dim))
+
     norms = x_f32.norm(dim=-1, keepdim=True).clamp_min(1e-10)
     unit = x_f32 / norms
 
@@ -143,11 +164,13 @@ def dequantize_pq(
     signs1: torch.Tensor,
     signs2: torch.Tensor,
     centroids: torch.Tensor,
+    head_dim: int | None = None,
 ) -> torch.Tensor:
     """PolarQuant decode: (indices, norms) → FP16 vectors.
 
-    indices: (..., head_dim) uint8
+    indices: (..., padded_dim) uint8
     norms: (...,) float32
+    head_dim: original (unpadded) dimension, or None if no padding
     Returns: (..., head_dim) float16
     """
     values = centroids[indices.long()]
@@ -157,6 +180,11 @@ def dequantize_pq(
     values = values * signs1
 
     values = values * norms.unsqueeze(-1)
+
+    # Unpad if needed
+    if head_dim is not None and values.shape[-1] != head_dim:
+        values = values[..., :head_dim]
+
     return values.to(torch.float16)
 
 
