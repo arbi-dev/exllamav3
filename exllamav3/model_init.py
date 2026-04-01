@@ -75,8 +75,7 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
-        parser.add_argument("-tq", "--turboquant", type = str, help = "Use TurboQuant KV cache. Specify 'turboquant25' or 'turboquant35'")
-        parser.add_argument("-tqm", "--turboquant_metadata", type = str, help = "Path to TurboQuant calibration metadata JSON")
+        parser.add_argument("-tq", "--turboquant", type = str, help = "Use TurboQuant KV cache. Specify kv_bits or k_bits,v_bits pair (e.g. -tq 4 or -tq 4,3)")
 
 
 def get_arg_sampler(args):
