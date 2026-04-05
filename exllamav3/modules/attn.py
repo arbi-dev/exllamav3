@@ -731,9 +731,23 @@ class Attention(Module):
             )
 
         if self.has_split_cache:
-            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+            cache_layer = self.tp_cache_lookup[cache]
+            cache_k, cache_v = cache_layer.get_kv(cache_seqlens, block_table)
         else:
             cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+            cache_layer = cache.layers[self.layer_idx] if hasattr(cache, 'layers') else None
+
+        # TurboKV pre-rotation: rotate Q before attention so KV can stay
+        # in rotated space (avoids WHT inverse in decode kernel).
+        tq_rotate = (cache_layer is not None
+                     and hasattr(cache_layer, 'has_pre_rotation')
+                     and cache_layer.has_pre_rotation)
+        if tq_rotate:
+            q = cache_layer.pre_rotate_q(q)
+            # Override softmax_scale since it's baked into the rotation
+            sm_scale = 1.0
+        else:
+            sm_scale = self.sm_scale
 
         o = flash_attn_with_kvcache(
             q = q,
@@ -744,13 +758,17 @@ class Attention(Module):
             block_table = block_table,
             cache_seqlens = cache_seqlens,
             causal = causal,
-            softmax_scale = self.sm_scale,
+            softmax_scale = sm_scale,
             window_size = (self.sliding_window, self.sliding_window),
             softcap = self.logit_softcapping
         )
 
+        # TurboKV post-rotation: inverse rotate output
+        if tq_rotate:
+            o = cache_layer.post_rotate_output(o)
+
         if self.has_split_cache:
-            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
+            cache_layer.update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
         else:
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
 

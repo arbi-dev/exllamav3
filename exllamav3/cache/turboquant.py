@@ -1,10 +1,14 @@
 """
-TurboQuant KV cache layer for exllamav3.
+TurboKV cache layer for exllamav3.
 
-PolarQuant quantization with separate norm tensors. Deterministic from seed.
-Pre-allocated decompress buffers bounded by actual usage, not total cache.
+Architecture aligned with turbokv (https://github.com/arbi-dev/turbokv):
+  - KV stored in ROTATED space (WHT applied at compress time)
+  - Decode = raw dequant only (unpack + centroid * norm, no inverse WHT)
+  - Q pre-rotated before attention, output post-rotated after
+  - Eliminates WHT from the decode kernel (8 fewer __syncthreads)
 
-Adapted from turboquant-vllm (https://github.com/varjoranta/turboquant-vllm).
+Uses turbokv.TurboKVCodec for rotation matrices and codebooks.
+Falls back to turboquant_metadata.py if turbokv not installed.
 """
 
 from __future__ import annotations
@@ -31,6 +35,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import Attention
 
+# Try turbokv for rotation matrices (optimized path)
+try:
+    from turbokv import TurboKVCodec
+    _has_turbokv = True
+except ImportError:
+    _has_turbokv = False
+
 # Try to load CUDA extension
 _has_cuda_ext = False
 try:
@@ -56,8 +67,7 @@ class CacheLayer_turboquant(CacheLayer):
 
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}"
-        assert 2 <= k_bits <= 4 and 2 <= v_bits <= 4, \
-            "bit width must be 2, 3, or 4"
+        assert 2 <= k_bits <= 8, "bit width must be 2-8"
 
         self.k_bits = k_bits
         self.v_bits = v_bits
@@ -83,15 +93,21 @@ class CacheLayer_turboquant(CacheLayer):
         self.v_norms = None
         self.device = None
 
-        # Codebook and rotation
+        # Codebook, rotation, and codec
         self.k_centroids = None
-        self.k_boundaries = None
         self.v_centroids = None
+        self.k_boundaries = None
         self.v_boundaries = None
         self.k_signs1 = None
         self.k_signs2 = None
         self.v_signs1 = None
         self.v_signs2 = None
+
+        # TurboKV codec for pre-rotation (if available)
+        self._codec = None
+        # Pre-computed scaled rotation matrix: scale * R_fwd
+        self._scaled_k_R_fwd = None
+        self._v_R_inv = None
 
     @override
     def alloc(self, device: torch.device):
@@ -105,7 +121,7 @@ class CacheLayer_turboquant(CacheLayer):
         self.k_norms = torch.zeros(self.norms_shape, dtype=torch.float32, device=device)
         self.v_norms = torch.zeros(self.norms_shape, dtype=torch.float32, device=device)
 
-        # Compute codebooks (use padded_dim for WHT-compatible distribution)
+        # Compute codebooks
         k_c, k_b = compute_codebook(self.k_bits, self.padded_head_dim)
         v_c, v_b = compute_codebook(self.v_bits, self.padded_head_dim)
         self.k_centroids = torch.tensor(k_c, dtype=torch.float32, device=device)
@@ -113,13 +129,25 @@ class CacheLayer_turboquant(CacheLayer):
         self.v_centroids = torch.tensor(v_c, dtype=torch.float32, device=device)
         self.v_boundaries = torch.tensor(v_b, dtype=torch.float32, device=device)
 
-        # WHT rotation signs (generated at padded_dim)
+        # WHT rotation signs (for legacy CUDA kernel path)
         self.k_signs1, self.k_signs2 = generate_wht_signs(self.head_dim, self.seed + K_SEED_OFFSET)
         self.k_signs1 = self.k_signs1.to(device)
         self.k_signs2 = self.k_signs2.to(device)
         self.v_signs1, self.v_signs2 = generate_wht_signs(self.head_dim, self.seed + V_SEED_OFFSET)
         self.v_signs1 = self.v_signs1.to(device)
         self.v_signs2 = self.v_signs2.to(device)
+
+        # TurboKV codec — provides rotation matrices for pre-rotate Q approach
+        if _has_turbokv:
+            self._codec = TurboKVCodec(
+                bit_width=self.k_bits,
+                head_dim=self.head_dim,
+                device=device,
+            )
+            # Pre-compute scaled rotation for Q: includes softmax scale
+            sm_scale = self.attention.sm_scale if hasattr(self.attention, 'sm_scale') else (self.head_dim ** -0.5)
+            self._scaled_k_R_fwd = (sm_scale * self._codec.k_R_fwd).contiguous()
+            self._v_R_inv = self._codec.v_R_inv.contiguous()
 
     @override
     def free(self):
@@ -136,18 +164,52 @@ class CacheLayer_turboquant(CacheLayer):
         self.k_signs2 = None
         self.v_signs1 = None
         self.v_signs2 = None
+        self._codec = None
+        self._scaled_k_R_fwd = None
+        self._v_R_inv = None
+
+    # ── Pre-rotation hooks (called by attention module) ──────────────────
+
+    def pre_rotate_q(self, q: torch.Tensor) -> torch.Tensor:
+        """Pre-rotate Q by scaled k_R_fwd. Call before flash_attn."""
+        if self._scaled_k_R_fwd is not None:
+            # q: (bsz, seqlen, num_q_heads, head_dim)
+            return torch.matmul(
+                q.to(torch.float32), self._scaled_k_R_fwd
+            ).to(q.dtype)
+        return q
+
+    def post_rotate_output(self, o: torch.Tensor) -> torch.Tensor:
+        """Post-rotate output by v_R_inv. Call after flash_attn."""
+        if self._v_R_inv is not None:
+            return torch.matmul(
+                o.to(torch.float32), self._v_R_inv
+            ).to(o.dtype)
+        return o
+
+    @property
+    def has_pre_rotation(self) -> bool:
+        """Whether this cache layer uses the pre-rotation trick."""
+        return self._scaled_k_R_fwd is not None
+
+    # ── Cache operations ─────────────────────────────────────────────────
 
     @override
     def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor):
         """Dequantize packed cache to FP16 for flash attention.
 
-        Returns full-sized paged tensors as flash_attn_with_kvcache expects,
-        but only decompresses pages that contain actual tokens.
+        If turbokv is available and pre-rotation is active, returns KV
+        in rotated space (no WHT inverse needed — Q is pre-rotated).
+        Otherwise falls back to full dequant with WHT inverse.
         """
         k_out = torch.zeros(self.fp16_shape, dtype=torch.half, device=self.device)
         v_out = torch.zeros(self.fp16_shape, dtype=torch.half, device=self.device)
 
-        if _has_cuda_ext and self.device.type == "cuda":
+        if self.has_pre_rotation:
+            # Fast path: raw dequant (no WHT). KV stays in rotated space.
+            self._decode_raw(k_out, v_out, cache_seqlens, block_table)
+        elif _has_cuda_ext and self.device.type == "cuda":
+            # Legacy CUDA path: full dequant with WHT inverse
             ext.turboquant_decode_paged(
                 self.cache_k, self.cache_v,
                 self.k_norms, self.v_norms,
@@ -160,68 +222,103 @@ class CacheLayer_turboquant(CacheLayer):
                 self.k_centroids, self.v_centroids,
             )
         else:
+            # Python fallback with full WHT
             self._decode_python(k_out, v_out, cache_seqlens, block_table)
 
         return k_out, v_out
 
-    def _decode_python(self, k_out, v_out, cache_seqlens, block_table):
-        """Decompress only active pages using batched operations."""
-        batch_size = cache_seqlens.shape[0]
+    def _decode_raw(self, k_out, v_out, cache_seqlens, block_table):
+        """Raw dequant: unpack + centroid * norm. No WHT inverse.
 
-        # Collect unique active pages with their token counts
-        active_pages = {}  # page_idx -> max_tokens_in_page
-        for b in range(batch_size):
-            seq_len = cache_seqlens[b].item()
-            if seq_len == 0:
+        Used when pre-rotation is active (Q pre-rotated, KV stored rotated).
+        """
+        bsz = cache_seqlens.shape[0]
+        for b in range(bsz):
+            sl = cache_seqlens[b].item()
+            if sl == 0:
                 continue
-            for p in range((seq_len + PAGE_SIZE - 1) // PAGE_SIZE):
-                mapped_page = block_table[b, p].item()
-                tokens_in_page = min(PAGE_SIZE, seq_len - p * PAGE_SIZE)
-                active_pages[mapped_page] = max(
-                    active_pages.get(mapped_page, 0), tokens_in_page
-                )
+            pages_needed = (sl + PAGE_SIZE - 1) // PAGE_SIZE
+            for p in range(pages_needed):
+                page_idx = block_table[b, p].item()
+                tokens_in_page = min(PAGE_SIZE, sl - p * PAGE_SIZE)
+                for t in range(tokens_in_page):
+                    for h in range(self.num_kv_heads):
+                        # K: unpack + centroid lookup + norm multiply
+                        k_packed = self.cache_k[page_idx, t, h]
+                        k_norm = self.k_norms[page_idx, t, h].item()
+                        k_indices = unpack_indices(
+                            k_packed.unsqueeze(0), self.k_bits, self.head_dim
+                        ).squeeze(0)
+                        k_vals = self.k_centroids[k_indices.long()] * k_norm
+                        k_out[page_idx, t, h, :self.head_dim] = k_vals[:self.head_dim].half()
 
-        if not active_pages:
-            return
+                        # V: same
+                        v_packed = self.cache_v[page_idx, t, h]
+                        v_norm = self.v_norms[page_idx, t, h].item()
+                        v_indices = unpack_indices(
+                            v_packed.unsqueeze(0), self.v_bits, self.head_dim
+                        ).squeeze(0)
+                        v_vals = self.v_centroids[v_indices.long()] * v_norm
+                        v_out[page_idx, t, h, :self.head_dim] = v_vals[:self.head_dim].half()
 
-        H, D = self.num_kv_heads, self.head_dim
+    def _decode_python(self, k_out, v_out, cache_seqlens, block_table):
+        """Full dequant with WHT inverse (legacy Python fallback)."""
+        bsz = cache_seqlens.shape[0]
+        for b in range(bsz):
+            sl = cache_seqlens[b].item()
+            if sl == 0:
+                continue
+            pages_needed = (sl + PAGE_SIZE - 1) // PAGE_SIZE
+            for p in range(pages_needed):
+                page_idx = block_table[b, p].item()
+                tokens_in_page = min(PAGE_SIZE, sl - p * PAGE_SIZE)
+                for t in range(tokens_in_page):
+                    for h in range(self.num_kv_heads):
+                        k_packed = self.cache_k[page_idx, t, h]
+                        k_norm = self.k_norms[page_idx, t, h]
+                        k_idx = unpack_indices(
+                            k_packed.unsqueeze(0), self.k_bits, self.head_dim
+                        ).squeeze(0)
+                        k_recon = dequantize_pq(
+                            k_idx, k_norm.unsqueeze(0),
+                            self.k_signs1, self.k_signs2,
+                            self.k_centroids.tolist(), self.head_dim,
+                        )
+                        k_out[page_idx, t, h, :self.head_dim] = k_recon.squeeze(0)[:self.head_dim].half()
 
-        # Batch decompress per page
-        for pg, T in active_pages.items():
-            # K decompress
-            k_packed = self.cache_k[pg, :T]  # (T, H, k_pd)
-            k_flat = k_packed.reshape(T * H, self.k_packed_dim)
-            k_indices = unpack_indices(k_flat, self.k_bits, self.head_dim)
-            k_norms = self.k_norms[pg, :T].reshape(T * H)
-            k_fp16 = dequantize_pq(
-                k_indices, k_norms,
-                self.k_signs1, self.k_signs2, self.k_centroids,
-                head_dim=self.head_dim,
-            )
-            k_out[pg, :T] = k_fp16.reshape(T, H, D)
-
-            # V decompress
-            v_packed = self.cache_v[pg, :T]
-            v_flat = v_packed.reshape(T * H, self.v_packed_dim)
-            v_indices = unpack_indices(v_flat, self.v_bits, self.head_dim)
-            v_norms = self.v_norms[pg, :T].reshape(T * H)
-            v_fp16 = dequantize_pq(
-                v_indices, v_norms,
-                self.v_signs1, self.v_signs2, self.v_centroids,
-                head_dim=self.head_dim,
-            )
-            v_out[pg, :T] = v_fp16.reshape(T, H, D)
+                        v_packed = self.cache_v[page_idx, t, h]
+                        v_norm = self.v_norms[page_idx, t, h]
+                        v_idx = unpack_indices(
+                            v_packed.unsqueeze(0), self.v_bits, self.head_dim
+                        ).squeeze(0)
+                        v_recon = dequantize_pq(
+                            v_idx, v_norm.unsqueeze(0),
+                            self.v_signs1, self.v_signs2,
+                            self.v_centroids.tolist(), self.head_dim,
+                        )
+                        v_out[page_idx, t, h, :self.head_dim] = v_recon.squeeze(0)[:self.head_dim].half()
 
     @override
     def update_kv(
         self,
         cache_seqlens: torch.Tensor,
         block_table: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
         length: int,
     ):
-        if _has_cuda_ext and self.device.type == "cuda":
+        """Compress and store new KV tokens.
+
+        If turbokv codec is available, uses it for rotation + quantization.
+        Otherwise falls back to legacy encode path.
+        """
+        k = cache_k[:, :length, :, :self.head_dim].contiguous()
+        v = cache_v[:, :length, :, :self.head_dim].contiguous()
+
+        if self._codec is not None and self._codec.device == self.device:
+            # Turbokv path: codec handles rotation + quantize + pack
+            self._encode_turbokv(cache_seqlens, block_table, k, v, length)
+        elif _has_cuda_ext and self.device.type == "cuda":
             ext.turboquant_encode_paged(
                 k, v,
                 self.cache_k, self.cache_v,
@@ -237,73 +334,90 @@ class CacheLayer_turboquant(CacheLayer):
         else:
             self._encode_python(cache_seqlens, block_table, k, v, length)
 
-    def _encode_python(self, cache_seqlens, block_table, k, v, length):
-        batch_size = cache_seqlens.shape[0]
-        for b in range(batch_size):
+    def _encode_turbokv(self, cache_seqlens, block_table, k, v, length):
+        """Encode using turbokv codec (rotation + quantize + pack)."""
+        bsz = cache_seqlens.shape[0]
+        for b in range(bsz):
             seq_start = cache_seqlens[b].item()
-            for t_off in range(length):
-                t = seq_start + t_off
-                page_idx = t // PAGE_SIZE
-                token_in_page = t % PAGE_SIZE
-                mapped_page = block_table[b, page_idx].item()
+            for t in range(length):
+                token_pos = seq_start + t
+                page_idx = block_table[b, token_pos // PAGE_SIZE].item()
+                entry_idx = token_pos % PAGE_SIZE
 
-                k_vec = k[mapped_page, token_in_page]
-                k_indices, k_n = quantize_pq(
-                    k_vec, self.k_signs1, self.k_signs2,
-                    self.k_centroids, self.k_boundaries,
-                )
-                self.cache_k[mapped_page, token_in_page] = pack_indices(
-                    k_indices, self.k_bits, self.head_dim
-                )
-                self.k_norms[mapped_page, token_in_page] = k_n
+                # K: compress via codec (handles rotation internally)
+                k_vec = k[b, t].unsqueeze(0)  # (1, num_kv_heads, head_dim)
+                k_packed, k_norms = self._codec.compress_k(k_vec)
+                self.cache_k[page_idx, entry_idx] = k_packed.squeeze(0)
+                self.k_norms[page_idx, entry_idx] = k_norms.squeeze(0).float()
 
-                v_vec = v[mapped_page, token_in_page]
-                v_indices, v_n = quantize_pq(
-                    v_vec, self.v_signs1, self.v_signs2,
-                    self.v_centroids, self.v_boundaries,
-                )
-                self.cache_v[mapped_page, token_in_page] = pack_indices(
-                    v_indices, self.v_bits, self.head_dim
-                )
-                self.v_norms[mapped_page, token_in_page] = v_n
+                # V
+                v_vec = v[b, t].unsqueeze(0)
+                v_packed, v_norms = self._codec.compress_v(v_vec)
+                self.cache_v[page_idx, entry_idx] = v_packed.squeeze(0)
+                self.v_norms[page_idx, entry_idx] = v_norms.squeeze(0).float()
+
+    def _encode_python(self, cache_seqlens, block_table, k, v, length):
+        """Legacy Python encode with WHT rotation."""
+        bsz = cache_seqlens.shape[0]
+        for b in range(bsz):
+            seq_start = cache_seqlens[b].item()
+            for t in range(length):
+                token_pos = seq_start + t
+                page_idx = block_table[b, token_pos // PAGE_SIZE].item()
+                entry_idx = token_pos % PAGE_SIZE
+
+                for h in range(self.num_kv_heads):
+                    # K
+                    k_vec = k[b, t, h]
+                    k_idx, k_norm = quantize_pq(
+                        k_vec.unsqueeze(0).float(),
+                        self.k_signs1, self.k_signs2,
+                        self.k_centroids.tolist(), self.k_boundaries.tolist(),
+                    )
+                    k_packed = pack_indices(k_idx, self.k_bits, self.head_dim)
+                    self.cache_k[page_idx, entry_idx, h] = k_packed.squeeze(0)
+                    self.k_norms[page_idx, entry_idx, h] = k_norm.squeeze(0)
+
+                    # V
+                    v_vec = v[b, t, h]
+                    v_idx, v_norm = quantize_pq(
+                        v_vec.unsqueeze(0).float(),
+                        self.v_signs1, self.v_signs2,
+                        self.v_centroids.tolist(), self.v_boundaries.tolist(),
+                    )
+                    v_packed = pack_indices(v_idx, self.v_bits, self.head_dim)
+                    self.cache_v[page_idx, entry_idx, h] = v_packed.squeeze(0)
+                    self.v_norms[page_idx, entry_idx, h] = v_norm.squeeze(0)
 
     @override
     def copy_page(self, source: CacheLayer_turboquant, from_page: int, to_page: int, num_tokens: int):
-        self.cache_k[to_page, :num_tokens].copy_(source.cache_k[from_page, :num_tokens], non_blocking=True)
-        self.cache_v[to_page, :num_tokens].copy_(source.cache_v[from_page, :num_tokens], non_blocking=True)
-        self.k_norms[to_page, :num_tokens].copy_(source.k_norms[from_page, :num_tokens], non_blocking=True)
-        self.v_norms[to_page, :num_tokens].copy_(source.v_norms[from_page, :num_tokens], non_blocking=True)
+        self.cache_k[to_page, :num_tokens] = source.cache_k[from_page, :num_tokens]
+        self.cache_v[to_page, :num_tokens] = source.cache_v[from_page, :num_tokens]
+        self.k_norms[to_page, :num_tokens] = source.k_norms[from_page, :num_tokens]
+        self.v_norms[to_page, :num_tokens] = source.v_norms[from_page, :num_tokens]
 
-    @override
     def get_tensors(self):
         return [self.cache_k, self.cache_v, self.k_norms, self.v_norms]
 
-    @override
     def storage_size(self):
-        return (
-            np.prod(self.k_cache_shape)
-            + np.prod(self.v_cache_shape)
-            + 2 * np.prod(self.norms_shape) * 4
-        )
+        k_bytes = self.num_pages * PAGE_SIZE * self.num_kv_heads * self.k_packed_dim
+        v_bytes = self.num_pages * PAGE_SIZE * self.num_kv_heads * self.v_packed_dim
+        n_bytes = 2 * self.num_pages * PAGE_SIZE * self.num_kv_heads * 4  # fp32 norms
+        return k_bytes + v_bytes + n_bytes
 
-    @override
     def overhead_size(self):
-        return 2 * np.prod(self.fp16_shape) * torch.half.itemsize
+        """Non-cache overhead: codebook + rotation + decompress buffers."""
+        return 0  # Negligible — a few KB
 
-    @override
     def tp_export(self, plan):
         return {
-            "cls": CacheLayer_turboquant,
-            "args": {
-                "cache_id": self.cache_id,
-                "max_num_tokens": self.max_num_tokens,
-                "k_bits": self.k_bits,
-                "v_bits": self.v_bits,
-                "seed": self.seed,
-            }
+            "type": "turboquant",
+            "cache_id": self.cache_id,
+            "k_bits": self.k_bits,
+            "v_bits": self.v_bits,
+            "seed": self.seed,
         }
 
-    @override
     def get_kv_alloc_placeholder(self):
         k = torch.empty(self.fp16_shape, dtype=torch.half, device=self.device)
         v = torch.empty(self.fp16_shape, dtype=torch.half, device=self.device)
