@@ -109,6 +109,11 @@ class CacheLayer_turboquant(CacheLayer):
         self._scaled_k_R_fwd = None
         self._v_R_inv = None
 
+        # Calibration state
+        self._calibrator = None
+        self._calibration_mode = False
+        self._calibration_tokens_seen = 0
+
     @override
     def alloc(self, device: torch.device):
         self.device = device
@@ -167,6 +172,80 @@ class CacheLayer_turboquant(CacheLayer):
         self._codec = None
         self._scaled_k_R_fwd = None
         self._v_R_inv = None
+
+    # ── Calibration ───────────────────────────────────────────────────────
+
+    def enable_calibration(self, warmup_tokens: int = 10000):
+        """Enable online calibration mode.
+
+        During calibration, the cache collects KV statistics from actual
+        inference. After `warmup_tokens` tokens, call `finish_calibration()`
+        to optimize centroids using Lloyd's algorithm on the real distribution.
+
+        This improves cosine similarity from ~0.989 (Gaussian codebook) to
+        ~0.998+ (data-optimized codebook).
+        """
+        if not _has_turbokv:
+            raise RuntimeError("turbokv required for calibration")
+        from turbokv.calibrate_online import OnlineCalibrator
+        self._calibrator = OnlineCalibrator(
+            num_layers=1,  # one calibrator per cache layer
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            bit_width=self.k_bits,
+        )
+        self._calibration_mode = True
+        self._calibration_tokens_seen = 0
+        self._calibration_warmup = warmup_tokens
+
+    def _collect_calibration(self, k: torch.Tensor, v: torch.Tensor):
+        """Collect KV samples during calibration warmup."""
+        if not self._calibration_mode or self._calibrator is None:
+            return
+        self._calibrator.collect(
+            layer_idx=0,
+            key=k,
+            value=v,
+            R_fwd_k=self._codec.k_R_fwd,
+            R_fwd_v=self._codec.v_R_fwd,
+        )
+        self._calibration_tokens_seen += k.shape[0]
+
+    def finish_calibration(self):
+        """Optimize centroids from collected data and apply.
+
+        Call after warmup inference. The calibrated codebook replaces the
+        default Gaussian codebook for all subsequent encode/decode.
+        """
+        if self._calibrator is None or not self._calibrator.has_enough(0):
+            return False
+
+        k_cent, k_bound, v_cent, v_bound = self._calibrator.optimize(
+            layer_idx=0, device=self.device
+        )
+        self.k_centroids = k_cent
+        self.k_boundaries = k_bound
+        self.v_centroids = v_cent
+        self.v_boundaries = v_bound
+
+        # Update codec if available
+        if self._codec is not None:
+            self._codec.k_centroids = k_cent
+            self._codec.k_boundaries = k_bound
+            self._codec.v_centroids = v_cent
+            self._codec.v_boundaries = v_bound
+
+        self._calibration_mode = False
+        return True
+
+    @property
+    def is_calibrating(self) -> bool:
+        return self._calibration_mode
+
+    @property
+    def calibration_ready(self) -> bool:
+        return (self._calibrator is not None
+                and self._calibrator.has_enough(0))
 
     # ── Pre-rotation hooks (called by attention module) ──────────────────
 
@@ -314,6 +393,13 @@ class CacheLayer_turboquant(CacheLayer):
         """
         k = cache_k[:, :length, :, :self.head_dim].contiguous()
         v = cache_v[:, :length, :, :self.head_dim].contiguous()
+
+        # Collect calibration data during warmup
+        if self._calibration_mode:
+            self._collect_calibration(
+                k.reshape(-1, self.num_kv_heads, self.head_dim),
+                v.reshape(-1, self.num_kv_heads, self.head_dim),
+            )
 
         if self._codec is not None and self._codec.device == self.device:
             # Turbokv path: codec handles rotation + quantize + pack
