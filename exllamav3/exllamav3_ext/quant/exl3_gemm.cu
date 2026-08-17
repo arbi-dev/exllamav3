@@ -102,8 +102,18 @@ uint64_t mgemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) MIN(bszm_in, 24));
-    mix((uint64_t) MIN(bszm_out, 24));
+    // Slot axis: exact below 24, log-bucketed above. A hard clamp collapses
+    // every launch with >= 24 slots into ONE cache entry, so the first shape to
+    // warm dictates (num_sms, concurrency) for all of them; a mismatched shape
+    // then pays up to 2.2x, and the pick persists to coop_autotune_v1.bin.
+    // roundup_pow2 keeps the entry count logarithmic, matching how size_m is
+    // already keyed in gemm_autotune_hash above.
+    auto slot_key = [] (int b) -> uint64_t
+    {
+        return (uint64_t) (b <= 24 ? b : MIN(roundup_pow2(b), 4096));
+    };
+    mix(slot_key(bszm_in));
+    mix(slot_key(bszm_out));
     return h;
 }
 
