@@ -41,14 +41,16 @@ void exl3_gemm_kernel_inner
 
     const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                         // in halfs
     const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
-    // Each row block gets its own k-reduction staging area: store() ends with a barrier but
-    // add() does not, so a shared area would let one block's store overwrite slots the previous
-    // block's add is still reading. The output-hadamard staging holds one 16-row block at a
-    // time and so does not scale with TILESIZE_M
+    // Every store/add pair in the k-reduction gets its own staging region. store() ends with a
+    // barrier but add() does not, so a region shared between two pairs would let the later
+    // pair's store overwrite slots the earlier pair's add is still reading. The sequences below
+    // run TILEBLOCKS_K - 1 pairs per row block. The output-hadamard staging holds one 16-row
+    // block at a time and so does not scale with TILESIZE_M
     const int sh_c_red_stride = 4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP;
+    const int sh_c_red_pairs = TILEBLOCKS_K > 1 ? TILEBLOCKS_K - 1 : 0;
     const int sh_c_size = MAX  // in floats
     (
-        TILEBLOCKS_M * sh_c_red_stride,
+        TILEBLOCKS_M * sh_c_red_pairs * sh_c_red_stride,
         shmem_out_had ? TILESIZE_N * 16 : 0
     );
 
@@ -324,11 +326,11 @@ void exl3_gemm_kernel_inner
     // Threadblock reduction
     auto threadblock_reduce = [&] ()
     {
-        auto store = [&] (int i, int m)
+        auto store = [&] (int i, int m, int slot)
         {
             if (sub_k == i)
             {
-                float* sh_red = sh_c + m * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
+                float* sh_red = sh_c + slot * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
@@ -339,11 +341,11 @@ void exl3_gemm_kernel_inner
             __syncthreads();
         };
 
-        auto add = [&] (int i, int m)
+        auto add = [&] (int i, int m, int slot)
         {
             if (sub_k == i)
             {
-                float* sh_red = sh_c + m * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
+                float* sh_red = sh_c + slot * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
@@ -353,11 +355,11 @@ void exl3_gemm_kernel_inner
             }
         };
 
-        auto store_small = [&] (int i, int m)
+        auto store_small = [&] (int i, int m, int slot)
         {
             if (sub_k == i && m * 16 + lane_id / 4 < size_m)
             {
-                float* sh_red = sh_c + m * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
+                float* sh_red = sh_c + slot * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
@@ -368,11 +370,11 @@ void exl3_gemm_kernel_inner
             __syncthreads();
         };
 
-        auto add_small = [&] (int i, int m)
+        auto add_small = [&] (int i, int m, int slot)
         {
             if (sub_k == i && m * 16 + lane_id / 4 < size_m)
             {
-                float* sh_red = sh_c + m * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
+                float* sh_red = sh_c + slot * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
@@ -382,59 +384,56 @@ void exl3_gemm_kernel_inner
             }
         };
 
-        // NOTE for TILEBLOCKS_K 3 and 4 (no shipped shape uses them yet): their sequences reuse
-        // one staging slot across successive store/add pairs, and add() ends without a barrier,
-        // so the next store() in the same sequence can overwrite a slot still being read. Give
-        // those pairs distinct slots, or a trailing barrier, before enabling such a shape
         #pragma unroll
         for (int m = 0; m < TILEBLOCKS_M; ++m)
         {
+            const int s0 = m * sh_c_red_pairs;
             if (size_m - m * 16 <= 8)
             {
                 if constexpr (TILEBLOCKS_K == 2)
                 {
-                    store_small(1, m);
-                    add_small(0, m);
+                    store_small(1, m, s0);
+                    add_small(0, m, s0);
                 }
                 if constexpr (TILEBLOCKS_K == 3)
                 {
-                    store_small(1, m);
-                    add_small(0, m);
-                    store_small(2, m);
-                    add_small(0, m);
+                    store_small(1, m, s0);
+                    add_small(0, m, s0);
+                    store_small(2, m, s0 + 1);
+                    add_small(0, m, s0 + 1);
                 }
                 if constexpr (TILEBLOCKS_K == 4)
                 {
-                    store_small(3, m);
-                    add_small(2, m);
-                    store_small(1, m);
-                    add_small(0, m);
-                    store_small(2, m);
-                    add_small(0, m);
+                    store_small(3, m, s0);
+                    add_small(2, m, s0);
+                    store_small(1, m, s0 + 1);
+                    add_small(0, m, s0 + 1);
+                    store_small(2, m, s0 + 2);
+                    add_small(0, m, s0 + 2);
                 }
             }
             else
             {
                 if constexpr (TILEBLOCKS_K == 2)
                 {
-                    store(1, m);
-                    add(0, m);
+                    store(1, m, s0);
+                    add(0, m, s0);
                 }
                 if constexpr (TILEBLOCKS_K == 3)
                 {
-                    store(1, m);
-                    add(0, m);
-                    store(2, m);
-                    add(0, m);
+                    store(1, m, s0);
+                    add(0, m, s0);
+                    store(2, m, s0 + 1);
+                    add(0, m, s0 + 1);
                 }
                 if constexpr (TILEBLOCKS_K == 4)
                 {
-                    store(3, m);
-                    add(2, m);
-                    store(1, m);
-                    add(0, m);
-                    store(2, m);
-                    add(0, m);
+                    store(3, m, s0);
+                    add(2, m, s0);
+                    store(1, m, s0 + 1);
+                    add(0, m, s0 + 1);
+                    store(2, m, s0 + 2);
+                    add(0, m, s0 + 2);
                 }
             }
         }
