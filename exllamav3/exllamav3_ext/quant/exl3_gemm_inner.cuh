@@ -382,6 +382,10 @@ void exl3_gemm_kernel_inner
             }
         };
 
+        // NOTE for TILEBLOCKS_K 3 and 4 (no shipped shape uses them yet): their sequences reuse
+        // one staging slot across successive store/add pairs, and add() ends without a barrier,
+        // so the next store() in the same sequence can overwrite a slot still being read. Give
+        // those pairs distinct slots, or a trailing barrier, before enabling such a shape
         #pragma unroll
         for (int m = 0; m < TILEBLOCKS_M; ++m)
         {
