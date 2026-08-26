@@ -60,12 +60,20 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #define EXL3_GEMM_SHAPE_5     32,     32,    128,     4,     3
 #define EXL3_GEMM_SHAPE_6     32,     16,    256,     4,     3
 
-#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 32
-#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 16
-#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 128, 256
-#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512, 256
+// Deeper row-block shapes. TILESIZE_K 16 keeps blockDim at 256, where the register cap is 255
+// rather than 128, which is what lets the A fragments and C accumulators for 3 and 4 row
+// blocks stay resident
+#define EXL3_GEMM_SHAPE_7     32,     16,    128,     4,     3
+#define EXL3_GEMM_SHAPE_8     48,     16,    128,     4,     3
+#define EXL3_GEMM_SHAPE_9     64,     16,    128,     4,     3
+#define EXL3_GEMM_SHAPE_10    32,     16,    512,     4,     3
 
-#define EXL3_GEMM_NUM_SHAPES 6
+#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 32, 32, 48, 64, 32
+#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 16, 16, 16, 16, 16
+#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 128, 256, 128, 128, 128, 512
+#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512, 256, 256, 256, 256, 256
+
+#define EXL3_GEMM_NUM_SHAPES 10
 
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
@@ -75,7 +83,11 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_6>
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_6>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_7>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_8>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_9>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_10>
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
@@ -84,7 +96,11 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_6>
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_6>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_7>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_8>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_9>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_10>
 
 #define EXL3_GEMM_BASE_THREADS 256
 
