@@ -68,12 +68,20 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #define EXL3_GEMM_SHAPE_9     64,     16,    128,     4,     3
 #define EXL3_GEMM_SHAPE_10    32,     16,    512,     4,     3
 
-#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 32, 32, 48, 64, 32
-#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 16, 16, 16, 16, 16
-#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 128, 256, 128, 128, 128, 512
-#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512, 256, 256, 256, 256, 256
+// Row blocks past four only fit at FRAG_STAGES 2. frag_a is [FRAG_STAGES][TILEBLOCKS_M], so the
+// third fragment stage costs four registers per row block; dropping it is what pays for rows 5
+// and 6. Verified spill-free at every K in 1..8 and every codebook, for both gemm and mgemm --
+// a seventh row block spills at K 3, 6 and 8, so 96 is the floor of the next shape, not a step
+// on the way to one
+#define EXL3_GEMM_SHAPE_11    80,     16,    128,     4,     2
+#define EXL3_GEMM_SHAPE_12    96,     16,    128,     4,     2
 
-#define EXL3_GEMM_NUM_SHAPES 10
+#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 32, 32, 48, 64, 32, 80, 96
+#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 16, 16, 16, 16, 16, 16, 16
+#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 128, 256, 128, 128, 128, 512, 128, 128
+#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512, 256, 256, 256, 256, 256, 256, 256
+
+#define EXL3_GEMM_NUM_SHAPES 12
 
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
@@ -87,7 +95,9 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_7>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_8>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_9>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_10>
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_10>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_11>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_12>
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
@@ -100,7 +110,9 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_7>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_8>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_9>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_10>
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_10>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_11>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_12>
 
 #define EXL3_GEMM_BASE_THREADS 256
 
