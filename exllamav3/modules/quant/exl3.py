@@ -7,9 +7,65 @@ from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
 
-AUTO_RECONSTRUCT_THRESHOLD = 144
+# Rows above which forward() dequantizes the weight once and runs cuBLAS
+# instead of tiling the trellis GEMM over M. The trellis kernel reads the
+# packed weight once per M tile and runs the tiles serially, so leg A costs
+# ceil(rows / TILESIZE_M) passes while reconstruct+hgemm costs exactly one at
+# any row count; the threshold is where the second is cheaper.
+#
+# It moved 144 -> 280 with the multi-row-block shape table. At the old
+# four-shape table every tile was 16 rows deep, and 144 was well calibrated
+# for it: the census-weighted crossover over a 27B EXL3 checkpoint measured
+# 165 there. The table now reaches 64 rows, which cuts leg A's pass count by
+# 4x in the deepest tile and moves the same measured crossover to 325. 280
+# rather than 325 because the cost curve is not symmetric about the crossing —
+# leg A's cost steps with the tile while leg B's is smooth, so being early to
+# leg B costs less than being late — and because 280 captures 99.4% of what
+# any single constant can recover across the row counts a prefill chunk
+# actually takes.
+AUTO_RECONSTRUCT_THRESHOLD = 280
+
+# A separate, much lower threshold for NARROW OUTPUT WIDTHS, where the trellis
+# GEMM stops being bandwidth-bound and starts being occupancy-bound. Leg A
+# tiles N at 128 at minimum, so an out_features of 1024 gives it 8 column
+# blocks to fill the machine with; measured on an RTX 4090 (128 SMs) a
+# 5120x1024 linear runs 8x off its own roofline at 32 rows, where a 5120x17408
+# one is within 1.8x. Leg B has no such floor — its reconstruct is a plain
+# memory-bound write and cuBLAS tiles the GEMM itself — so it takes over far
+# earlier: crossover measured between 32 and 40 rows for 5120x1024, against
+# 230-427 for every wider geometry in the same checkpoint.
+#
+# The bound is a multiple of 128, so it reads the same on a Hadamard-padded
+# out_features as on the declared one (padding rounds up to 128, and anything
+# at or below 2048 stays at or below it) — the gate cannot disagree between
+# this dispatch and a caller that mirrors it from kernel dims.
+#
+# 64 rather than the measured ~38 crossing for two reasons that agree: it is
+# the deepest tile the shape table offers, so leg A keeps its whole cheapest
+# regime; and it sits above the widest speculative verify slate any shipped
+# recipe produces (max_batch 4 x K+1 8 = 32 rows), so a verify block and a
+# plain decode of the same tokens never land on different legs. The rows
+# between 38 and 64 are worth ~0.14 ms per forward across the 34 narrow
+# linears of a 27B checkpoint, which is not worth buying either of those.
+NARROW_RECONSTRUCT_MAX_N = 2048
+NARROW_RECONSTRUCT_THRESHOLD = 64
+
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
+
+
+def auto_reconstruct_threshold(out_features: int) -> int:
+    """Row count above which this linear should reconstruct rather than tile.
+
+    One function rather than a bare constant because the crossover is a
+    property of the SHAPE, not of the model: see NARROW_RECONSTRUCT_MAX_N.
+    Callers that mirror this dispatch (arbi-serve's custom op does, to own its
+    output buffer under cudagraph capture) must call this and never re-derive
+    it, or the two implementations drift on a checkpoint neither was tested on.
+    """
+    if out_features <= NARROW_RECONSTRUCT_MAX_N:
+        return NARROW_RECONSTRUCT_THRESHOLD
+    return AUTO_RECONSTRUCT_THRESHOLD
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
@@ -132,7 +188,8 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
+            if rows <= auto_reconstruct_threshold(self.out_features) \
+                    or self.config.infer_params.no_reconstruct:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
