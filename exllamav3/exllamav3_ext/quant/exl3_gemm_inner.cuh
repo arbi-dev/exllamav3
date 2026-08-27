@@ -87,6 +87,12 @@ void exl3_gemm_kernel_inner
     int warp_id = t / 32;
     int lane_id = t % 32;
 
+    // Row blocks the caller actually filled. The final strip of a batch is
+    // partial, and a row block past it holds no output the kernel will ever
+    // write, so its MMAs and A fragments are pure waste. Uniform across the
+    // CTA, so the guards below predicate rather than diverge
+    const int m_blocks = CEIL_DIVIDE(size_m, 16);
+
     // Dimensions
     //int tiles_m = CEIL_DIVIDE(size_m, TILESIZE_M);
     int tiles_k = size_k / TILESIZE_K;
@@ -290,6 +296,7 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
             {
+                if constexpr (TILEBLOCKS_M > 1) if (m >= m_blocks) continue;
                 int R = r + m * 16;
                 int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
                 ldsm4(frag_a[buf][m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
@@ -676,6 +683,7 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
             {
+                if constexpr (TILEBLOCKS_M > 1) if (m >= m_blocks) continue;
                 #if EXL3_GEMM_H_ACC
                     ptx_mma_m16n8k16(frag_a[buf][m], frag_b[buf][n], frag_c_h[m][n]);
                 #else
