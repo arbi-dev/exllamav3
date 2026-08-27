@@ -593,7 +593,15 @@ def load_parallel_calib_modules(replica_models, idx, devices, load_slice, source
     try:
         for rm, dev in zip(replica_models, devices[1:]):
             rep = rm.modules[idx]
-            rep.load(torch.device(dev), load_slice = load_slice, **({"source": source} if source is not None else {}))
+            if source is None and rep.can_defer_load():
+                rm.config.stc.begin_deferred_load()
+                try:
+                    rep.load(torch.device(dev), load_slice = load_slice)
+                finally:
+                    rm.config.stc.end_deferred_load()
+            else:
+                rep.load(torch.device(dev), load_slice = load_slice,
+                         **({"source": source} if source is not None else {}))
             replicas.append(rep)
         return replicas
     except Exception as e:
@@ -684,7 +692,6 @@ def capture_module_parallel(
                 if slicing:
                     params["q_mlp_slice"] = current_slice
                 get_preserve(i, params)
-                model.per_layer_quant_preamble(params)
                 rs = module.prepare_for_device(state[i], params)
                 rs = module.forward(rs, params)
                 put_preserve(i, params)
@@ -698,7 +705,6 @@ def capture_module_parallel(
                         if slicing:
                             params["q_mlp_slice"] = current_slice
                         get_preserve(i, params)
-                        model.per_layer_quant_preamble(params)
                         rs = module.prepare_for_device(state[i], params)
                         rs = module.forward(rs, params)
                         put_preserve(i, params)
@@ -784,7 +790,6 @@ def advance_state_parallel(
                 row_bad = False
                 if i < num_ref_states or not is_last_module:
                     get_preserve(i, params)
-                    model.per_layer_quant_preamble(params)
                     rs = module.forward(state[i], params)
                     if not torch.isfinite(rs).all().item():
                         row_bad = True
@@ -985,12 +990,10 @@ def main(args, job_state):
 
     # With multiple devices, run the capture and state-advance forward passes with calibration rows split
     # across replicas of the current module, one per device. Calibration rows are independent and the H proxy
-    # is a plain sum over token batches, so shards merge exactly. Models with a custom per-layer preamble
-    # (module state prepared on the primary device) fall back to the serial path.
+    # is a plain sum over token batches, so shards merge exactly.
     parallel_calib = (
         state is not None and
-        len(devices) > 1 and
-        type(model).per_layer_quant_preamble is Model.per_layer_quant_preamble
+        len(devices) > 1
     )
     replica_models = [Model.from_config(config) for _ in devices[1:]] if parallel_calib else []
 
@@ -1021,10 +1024,22 @@ def main(args, job_state):
             # Load current module
             slice_str = f" (slice {current_slice + 1}/{module.num_slices})" if slicing else ""
             print(f" -- Loading unquantized module: {module.key}" + slice_str)
-            module.load(
-                torch.device("cpu") if module.caps.get("prefer_cpu") else device,
-                load_slice = current_slice if slicing else None
-            )
+            # Deferred mode batches every tensor of the module into coalesced, multithreaded
+            # engine reads; big sparse layers otherwise pay one synchronous round trip per
+            # expert tensor, which is latency-bound on slow/network storage. can_defer_load()
+            # excludes modules whose load derives copies from unfilled tensors (e.g. sliced
+            # Linears, whose LinearFP16 copies each slice out of its source at construction)
+            defer = module.can_defer_load()
+            if defer:
+                module.config.stc.begin_deferred_load()
+            try:
+                module.load(
+                    torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+                    load_slice = current_slice if slicing else None
+                )
+            finally:
+                if defer:
+                    module.config.stc.end_deferred_load()
             for m in module:
                 if m.used_alt_key and not slicing:
                     print(f"     - Cloned {m.key} from {m.alt_key}")
@@ -1077,7 +1092,6 @@ def main(args, job_state):
                                 if slicing:
                                      params["q_mlp_slice"] = current_slice
                                 get_preserve(i, params)
-                                model.per_layer_quant_preamble(params)
                                 rs = module.prepare_for_device(state[i], params)
                                 rs = module.forward(rs, params)
                                 put_preserve(i, params)
@@ -1091,7 +1105,6 @@ def main(args, job_state):
                                         if slicing:
                                             params["q_mlp_slice"] = current_slice
                                         get_preserve(i, params)
-                                        model.per_layer_quant_preamble(params)
                                         rs = module.prepare_for_device(state[i], params)
                                         rs = module.forward(rs, params)
                                         put_preserve(i, params)
@@ -1223,7 +1236,6 @@ def main(args, job_state):
                         state[i] = module.prepare_for_device(state[i], params)
                         if i < num_ref_states or idx < len(model.modules) - 1:
                             get_preserve(i, params)
-                            model.per_layer_quant_preamble(params)
                             rs = module.forward(state[i], params)
                             if not torch.isfinite(rs).all().item():
                                 bad_rows.add(i)
@@ -1287,7 +1299,14 @@ def main(args, job_state):
 
             q_tensors = {}
             print(f" -- Loading unquantized module: {module.key}")
-            module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+            defer = module.can_defer_load()
+            if defer:
+                module.config.stc.begin_deferred_load()
+            try:
+                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+            finally:
+                if defer:
+                    module.config.stc.end_deferred_load()
             for m in module:
                 if m.used_alt_key:
                     print(f"     - Cloned {m.key} from {m.alt_key}")

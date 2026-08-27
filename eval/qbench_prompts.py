@@ -76,7 +76,7 @@ CONVERSATIONS = [
       "Retell the same story as a series of terse logbook entries."]),
 ]
 
-TEMPLATE_VARS = dict(enable_thinking = True, reasoning_effort = "high")
+DEFAULT_TEMPLATE_VARS = dict(enable_thinking = True, reasoning_effort = "high")
 
 col_default = "\u001b[0m"
 col_yellow = "\u001b[33;1m"
@@ -100,8 +100,22 @@ def clean_response_for_context(tokenizer, response_ids: torch.Tensor) -> str:
 
 @torch.inference_mode()
 def main(args):
-    model, config, cache, tokenizer, *_ = model_init.init(args)
-    generator = Generator(model, cache, tokenizer, max_chunk_size = 2048)
+    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+    generator = Generator(
+        model = model,
+        cache = cache,
+        tokenizer = tokenizer,
+        draft_model = draft_model,
+        draft_cache = draft_cache,
+        num_draft_tokens = args.num_draft_tokens,
+        ngram_match_min = args.ngram_match_min,
+        dynamic_draft_tokens = args.dynamic_draft,
+        draft_confidence = args.draft_confidence,
+        max_chunk_size = 2048
+    )
+
+    TEMPLATE_VARS = DEFAULT_TEMPLATE_VARS.copy()
+    TEMPLATE_VARS.update(args.template_vars)
 
     rows = []
     total_in = total_out = 0
@@ -181,8 +195,9 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
-    model_init.add_args(parser, default_cache_size = 32768)
+    model_init.add_args(parser, default_cache_size = 32768, add_draft_model_args = True)
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output JSON file")
     parser.add_argument("--min_tokens", type = int, default = 20000, help = "Stop once this many response tokens are collected")
     parser.add_argument("--max_new_tokens", type = int, default = 4096, help = "Per-turn generation cap")
+    parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
     main(parser.parse_args())

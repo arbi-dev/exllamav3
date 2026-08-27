@@ -5,33 +5,41 @@ import weakref
 
 from ..model.config import Config
 from ..model.model import Model
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
+from ..modules import RMSNorm, Embedding, TransformerBlock, MLAttention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.arch_specific.qwen3_5_mtp import Qwen3_5MTPInputLayer
 from ..modules.attn import prepare_for_attn
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from .hy_v3 import HyV3Config
+    from .glm_moe_dsa import GlmMoeDsaConfig
 
 
-class HyV3MTPModel(Model):
+class GlmMoeDsaMTPModel(Model):
+    """
+    GLM-5.2 MTP head: DeepSeek-V3 shape (enorm/hnorm/eh_proj concat into one trunk-style
+    decoder layer, shared_head.norm before the shared lm_head), stored as model.layers.78.
+    The layer is full-fat: MLA attention WITH its own DSA indexer, and the complete
+    256-expert MoE. One native draft depth (num_nextn_predict_layers 1); deeper drafts
+    iterate the block on its own output, DeepSeek style.
+
+    The config's index_share_for_mtp_iteration flag would let draft iterations reuse the
+    trunk's top-k selection; this implementation lets the layer's own indexer score instead
+    (self-consistent, and identical below index_topk context).
+    """
 
     def __init__(
         self,
-        config: HyV3Config,
+        config: GlmMoeDsaConfig,
         key_prefix: str = "model",
         **kwargs
     ):
         super().__init__(config, **kwargs)
 
-        # MTP layers are stored as regular decoder layers following the trunk, i.e. model.layers.80
-        # for the 80-layer model, with the eh_proj input projection and pre-projection norms carried
-        # as extra tensors within the layer
         first_mtp_layer = config.num_hidden_layers
 
-        # Input layer: normed token embedding concatenated with normed target hidden state, projected
-        # 2H -> H by eh_proj. Same mechanism as Qwen3.5 MTP apart from plain RMSNorms (no constant
-        # bias) and DeepSeek-V3 style tensor names
+        # Input layer: normed token embedding concatenated with normed target hidden state,
+        # projected 2H -> H. Same mechanism as Qwen3.5/HyV3 MTP with DeepSeek-V3 tensor names
+        # and plain RMSNorms
         self.input_layer = Qwen3_5MTPInputLayer(
             config = config,
             key = f"{key_prefix}.layers.{first_mtp_layer}.input",
@@ -49,40 +57,9 @@ class HyV3MTPModel(Model):
         self.modules = [self.input_layer]
 
         self.first_block_idx = len(self.modules)
-        self.attn_modules = []
 
         for idx in range(config.num_mtp_layers):
             key = f"{key_prefix}.layers.{first_mtp_layer + idx}"
-            attn = Attention(
-                config = config,
-                key = f"{key}.self_attn",
-                layer_idx = idx,
-                hidden_size = config.hidden_size,
-                head_dim = config.head_dim,
-                num_q_heads = config.num_q_heads,
-                num_kv_heads = config.num_kv_heads,
-                rope_settings = config.rope_settings,
-                sm_scale = None,
-                key_q = "q_proj",
-                key_k = "k_proj",
-                key_v = "v_proj",
-                key_o = "o_proj",
-                qmap = "block.attn",
-                q_norm = RMSNorm(
-                    config = config,
-                    key = f"{key}.self_attn.q_norm",
-                    rms_norm_eps = config.rms_norm_eps,
-                ) if config.use_qk_norm else None,
-                k_norm = RMSNorm(
-                    config = config,
-                    key = f"{key}.self_attn.k_norm",
-                    rms_norm_eps = config.rms_norm_eps,
-                ) if config.use_qk_norm else None,
-                out_dtype = torch.float,
-                qbits_key = "mtp_bits",
-            )
-            self.attn_modules.append(attn)
-
             self.modules.append(
                 TransformerBlock(
                     config = config,
@@ -93,7 +70,29 @@ class HyV3MTPModel(Model):
                         key = f"{key}.input_layernorm",
                         rms_norm_eps = config.rms_norm_eps,
                     ),
-                    attn = attn,
+                    attn = MLAttention(
+                        config = config,
+                        key = f"{key}.self_attn",
+                        layer_idx = idx,
+                        hidden_size = config.hidden_size,
+                        num_q_heads = config.num_q_heads,
+                        kv_lora_rank = config.kv_lora_rank,
+                        qk_nope_head_dim = config.qk_nope_head_dim,
+                        qk_rope_head_dim = config.qk_rope_head_dim,
+                        v_head_dim = config.v_head_dim,
+                        rope_settings = config.rope_settings,
+                        q_lora_rank = config.q_lora_rank,
+                        sm_scale = config.sm_scale,
+                        rms_norm_eps = config.rms_norm_eps,
+                        qmap = "block.attn",
+                        out_dtype = torch.float,
+                        select_hq_bits = 2,
+                        qbits_key = "mtp_bits",
+                        indexer_mode = "full",
+                        index_n_heads = config.index_n_heads,
+                        index_head_dim = config.index_head_dim,
+                        index_topk = config.index_topk,
+                    ),
                     mlp_norm = RMSNorm(
                         config = config,
                         key = f"{key}.post_attention_layernorm",
@@ -109,19 +108,19 @@ class HyV3MTPModel(Model):
                         key_up = "experts.{expert_idx}.up_proj",
                         key_gate = "experts.{expert_idx}.gate_proj",
                         key_down = "experts.{expert_idx}.down_proj",
-                        key_routing_gate = "router.gate",
-                        key_e_score_bias = "expert_bias",
+                        key_routing_gate = "gate",
+                        key_e_score_bias = "gate.e_score_correction_bias",
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
                         router_type = "dots",
                         routed_scaling_factor = config.routed_scaling_factor,
-                        n_group = 1,
-                        topk_group = 1,
+                        n_group = config.n_group,
+                        topk_group = config.topk_group,
                         qbits_key = "mtp_bits",
                         shared_experts = GatedMLP(
                             config = config,
-                            key = f"{key}.mlp.shared_mlp",
+                            key = f"{key}.mlp.shared_experts",
                             hidden_size = config.hidden_size,
                             intermediate_size = config.moe_intermediate_size * config.num_shared_experts,
                             key_up = "up_proj",
@@ -132,17 +131,17 @@ class HyV3MTPModel(Model):
                             out_dtype = torch.float,
                             qbits_key = "mtp_bits",
                             select_hq_bits = 2,
-                        ),
+                        ) if config.num_shared_experts else None,
                     ),
                 )
             )
 
         self.last_kv_module_idx = len(self.modules) - 1
 
-        # Final norm
+        # Final norm before the (shared) lm_head
         self.final_norm = RMSNorm(
             config = config,
-            key = f"{key_prefix}.layers.{first_mtp_layer + config.num_mtp_layers - 1}.final_layernorm",
+            key = f"{key_prefix}.layers.{first_mtp_layer + config.num_mtp_layers - 1}.shared_head.norm",
             rms_norm_eps = config.rms_norm_eps,
             out_dtype = torch.half,
         )
@@ -159,6 +158,11 @@ class HyV3MTPModel(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
+        # Which trunk state hnorm consumes: the post-final-norm state (HyV3/Qwen3.5 behavior)
+        # or the pre-norm residual (DeepSeek-V3 paper semantics). Settled empirically in
+        # attach_to's docstring; kept as an attribute so the comparison is reproducible
+        self.pre_norm_tap = False
+
         # Cross-references populated by attach_to()
         self.target_embed = None
         self.target_lm_head = None
@@ -167,8 +171,8 @@ class HyV3MTPModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        # MTP doesn't take input_ids through Embedding here — embedding is handled in step()
-        # But prepare_for_attn still wires up flash-attn params
+        # MTP doesn't take input_ids through Embedding here — embedding is handled by the
+        # input layer. prepare_for_attn still wires up flash-attn params
         return prepare_for_attn(input_ids, params)
 
 
@@ -179,12 +183,11 @@ class HyV3MTPModel(Model):
 
     def attach_to(self, target):
         """
-        Bind to target model: borrow embed_tokens / lm_head and tell target to export hidden state.
-
-        Despite the DeepSeek-V3 style tensor names, Hy3 MTP consumes the trunk's post-final-norm
-        hidden state like Qwen3.5 MTP, not the pre-norm residual stream. Empirically, greedy
-        agreement with the trunk's next-token predictions is 57% for the post-norm state vs 17%
-        for the pre-norm residual.
+        Bind to target model: borrow embed_tokens / lm_head and tell the target to export its
+        hidden state. Like HyV3 (and unlike the DeepSeek-V3 paper reading of the same tensor
+        names), GLM-5.2's MTP wants the trunk's POST-final-norm state: measured on the 3.00 bpw
+        model with an fp16 MTP head, greedy draft acceptance is 70% for the post-norm state vs
+        52% for the pre-norm residual (pre_norm_tap = True selects the latter for A/B testing).
         """
         self.input_layer.attached_model = weakref.ref(target)
         self.attached_model = weakref.ref(target)
@@ -202,11 +205,17 @@ class HyV3MTPModel(Model):
         assert isinstance(target.modules[-1], Linear), "Expected Linear lm_head as last target module"
         self.target_lm_head = weakref.ref(target.modules[-1])
 
-        target_norm = target.modules[target.logit_layer_idx - 1]
-        assert isinstance(target_norm, RMSNorm), "Expected target final RMSNorm immediately before lm_head"
-        self.draft_verifier_params.update({
-            "export_state_norm_keys": {target_norm.key},
-        })
+        if self.pre_norm_tap:
+            self.draft_verifier_params = {
+                "export_state_layers": {self.config.num_hidden_layers - 1},
+            }
+        else:
+            target_norm = target.modules[target.logit_layer_idx - 1]
+            assert isinstance(target_norm, RMSNorm), \
+                "Expected target final RMSNorm immediately before lm_head"
+            self.draft_verifier_params = {
+                "export_state_norm_keys": {target_norm.key},
+            }
 
 
     def default_load_shape_dtype(self, chunk_size):
@@ -222,20 +231,15 @@ class HyV3MTPModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        if not self.attached_model().loaded_tp:
-            ll = self.attached_model().logit_layer_idx
-            lm = self.attached_model().modules[ll]
-            logits = lm.prepare_for_device(state, params)
-            logits = lm.forward(logits, params)
-            if params.get("export_draft_conf"):
-                # Per-position confidence for the generator's draft truncation: the argmax logit
-                # value, over the unpadded vocabulary
-                logits = logits[..., :self.attached_model().config.vocab_size]
-                conf, ids = torch.max(logits, dim = -1)
-                params["draft_conf"] = conf
-                return ids
-            return torch.argmax(logits, dim = -1)
-        else:
-            state = self.attached_model().tp_producer.send(state)
-            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
-            return argmax
+        ll = self.attached_model().logit_layer_idx
+        lm = self.attached_model().modules[ll]
+        logits = lm.prepare_for_device(state, params)
+        logits = lm.forward(logits, params)
+        if params.get("export_draft_conf"):
+            # Per-position confidence for the generator's draft truncation: the argmax logit
+            # value, over the unpadded vocabulary
+            logits = logits[..., :self.attached_model().config.vocab_size]
+            conf, ids = torch.max(logits, dim = -1)
+            params["draft_conf"] = conf
+            return ids
+        return torch.argmax(logits, dim = -1)
