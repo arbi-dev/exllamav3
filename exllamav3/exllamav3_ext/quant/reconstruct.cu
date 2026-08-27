@@ -148,6 +148,12 @@ void reconstruct_slice
 // (per 128x128 tile, 1/sqrt(128) per side), i.e. the ORIGINAL-basis weights, so the hgemm
 // prefill path can run on the raw input with no standalone input/output had_r_128 launches.
 //
+// Both transforms accumulate in fp32 and round to fp16 exactly once per pass, at the tile
+// store and at the global store. This weight feeds a prefill GEMM whose output lands in the
+// KV that the MTP drafter reads, a channel sensitive to weight error far below the 4-bit
+// quantisation floor, so the butterfly cannot afford a rounding per stage. The tile itself
+// stays fp16, so shared memory and occupancy are unchanged.
+//
 // 128x128 tile lives in shared memory with an XOR swizzle on the half4 chunk index
 // (chunk ^= (row >> 2) & 31) making all phases bank-conflict-free except the 16-lane dequant
 // scatter; both transforms reuse the natural-order Sylvester butterfly (symmetric, so
@@ -237,43 +243,50 @@ void reconstruct_had_kernel
     }
     __syncthreads();
 
-    const half2 rs2 = __float2half2_rn(r_scale);
     constexpr int CHUNKS_PW = 32 / (RH_THREADS / 32);
     #pragma unroll
     for (int qq = 0; qq < CHUNKS_PW; ++qq)
     {
         int q = warp_id * CHUNKS_PW + qq;
         int qs = q ^ lane_id;
-        // a[i]/b[i]: 4 columns x row (4 * lane + i), all four rows share swizzle == lane
-        half2 a[4], b[4];
+        // c[i]: 4 columns x row (4 * lane + i), all four rows share swizzle == lane
+        float4 c[4];
         #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
             half4 v = *((const half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2));
-            a[i] = v.x;
-            b[i] = v.y;
+            float2 lo = __half22float2(v.x), hi = __half22float2(v.y);
+            c[i] = make_float4(lo.x, lo.y, hi.x, hi.y);
         }
-        // butterfly over the 4 rows, two columns at a time, fp16 with pre-applied scale
-        #pragma unroll
-        for (int x = 0; x < 2; ++x)
+        // butterfly over the 4 rows, four columns at a time; the half4 store below is this
+        // pass's only rounding
         {
-            half2* v = x == 0 ? a : b;
-            half2 s0 = __hadd2(v[0], v[1]), d0 = __hsub2(v[0], v[1]);
-            half2 s1 = __hadd2(v[2], v[3]), d1 = __hsub2(v[2], v[3]);
-            v[0] = __hmul2(__hadd2(s0, s1), rs2);
-            v[1] = __hmul2(__hadd2(d0, d1), rs2);
-            v[2] = __hmul2(__hsub2(s0, s1), rs2);
-            v[3] = __hmul2(__hsub2(d0, d1), rs2);
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-                v[i] = shuffle_had_h2x32(v[i], lane_id);
+            float4 s0 = make_float4(c[0].x + c[1].x, c[0].y + c[1].y,
+                                    c[0].z + c[1].z, c[0].w + c[1].w);
+            float4 d0 = make_float4(c[0].x - c[1].x, c[0].y - c[1].y,
+                                    c[0].z - c[1].z, c[0].w - c[1].w);
+            float4 s1 = make_float4(c[2].x + c[3].x, c[2].y + c[3].y,
+                                    c[2].z + c[3].z, c[2].w + c[3].w);
+            float4 d1 = make_float4(c[2].x - c[3].x, c[2].y - c[3].y,
+                                    c[2].z - c[3].z, c[2].w - c[3].w);
+            c[0] = make_float4((s0.x + s1.x) * r_scale, (s0.y + s1.y) * r_scale,
+                               (s0.z + s1.z) * r_scale, (s0.w + s1.w) * r_scale);
+            c[1] = make_float4((d0.x + d1.x) * r_scale, (d0.y + d1.y) * r_scale,
+                               (d0.z + d1.z) * r_scale, (d0.w + d1.w) * r_scale);
+            c[2] = make_float4((s0.x - s1.x) * r_scale, (s0.y - s1.y) * r_scale,
+                               (s0.z - s1.z) * r_scale, (s0.w - s1.w) * r_scale);
+            c[3] = make_float4((d0.x - d1.x) * r_scale, (d0.y - d1.y) * r_scale,
+                               (d0.z - d1.z) * r_scale, (d0.w - d1.w) * r_scale);
         }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            shuffle_had_f4x32(c[i].x, c[i].y, c[i].z, c[i].w, lane_id);
         #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
             half4 v;
-            v.x = a[i];
-            v.y = b[i];
+            v.x = __floats2half2_rn(c[i].x, c[i].y);
+            v.y = __floats2half2_rn(c[i].z, c[i].w);
             *((half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2)) = v;
         }
     }
@@ -284,6 +297,8 @@ void reconstruct_had_kernel
     // coalesced 256-byte row directly.
     constexpr int ROWS_PW = 128 / (RH_THREADS / 32);
     const half4 sv4 = ((const half4*) svh)[nb * 32 + lane_id];
+    const float2 sv01 = __half22float2(sv4.x);
+    const float2 sv23 = __half22float2(sv4.y);
     #pragma unroll
     for (int rr = 0; rr < ROWS_PW; ++rr)
     {
@@ -295,14 +310,13 @@ void reconstruct_had_kernel
         float v2 = __low2float(v23), v3 = __high2float(v23);
         float s0 = v0 + v1, d0 = v0 - v1;
         float s1 = v2 + v3, d1 = v2 - v3;
-        half2 h01 = __hmul2(__floats2half2_rn(s0 + s1, d0 + d1), rs2);
-        half2 h23 = __hmul2(__floats2half2_rn(s0 - s1, d0 - d1), rs2);
-        h01 = shuffle_had_h2x32(h01, lane_id);
-        h23 = shuffle_had_h2x32(h23, lane_id);
-        half2 su2 = __half2half2(suh[kb * 128 + R]);
+        float h0 = (s0 + s1) * r_scale, h1 = (d0 + d1) * r_scale;
+        float h2 = (s0 - s1) * r_scale, h3 = (d0 - d1) * r_scale;
+        shuffle_had_f4x32(h0, h1, h2, h3, lane_id);
+        float su = __half2float(suh[kb * 128 + R]);
         half4 v;
-        v.x = __hmul2(__hmul2(h01, su2), sv4.x);
-        v.y = __hmul2(__hmul2(h23, su2), sv4.y);
+        v.x = __floats2half2_rn(h0 * su * sv01.x, h1 * su * sv01.y);
+        v.y = __floats2half2_rn(h2 * su * sv23.x, h3 * su * sv23.y);
         *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
     }
 }
