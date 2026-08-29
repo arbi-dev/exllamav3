@@ -144,7 +144,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
-    m.def("hgemm", &hgemm, "hgemm");
+    // `accum_mode` selects the fp16-output path's cuBLAS accumulator
+    // (HGemmAccum in hgemm.cuh). Optional and defaulted, so every existing
+    // 3-argument call keeps today's fp32 accumulate. Omitting it resolves
+    // HGEMM_ACCUM_DEFAULT -> EXL3_HGEMM_FP16_ACCUM; the env var is honoured
+    // HERE and not inside hgemm() itself, so it reaches Python callers (the
+    // reconstruct+hgemm prefill leg) without touching the in-kernel hgemm_gr
+    // call sites that share this GEMM.
+    m.def("hgemm",
+          [](at::Tensor a, at::Tensor b, at::Tensor c, int64_t accum_mode)
+          {
+              hgemm(a, b, c, accum_mode == HGEMM_ACCUM_DEFAULT
+                                 ? hgemm_default_accum()
+                                 : (int) accum_mode);
+          },
+          "hgemm",
+          py::arg("a"), py::arg("b"), py::arg("c"),
+          py::arg("accum_mode") = (int64_t) HGEMM_ACCUM_DEFAULT);
+    m.def("hgemm_default_accum", &hgemm_default_accum, "hgemm_default_accum");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");

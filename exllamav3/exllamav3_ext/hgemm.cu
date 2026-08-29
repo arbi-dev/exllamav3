@@ -6,22 +6,46 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include <limits>
+#include <cstdlib>
+#include <cstring>
 
 /*
 
 Row-major matmul using cuBLAS, a @ b -> c
-- if c is float16, operation is float16 @ float16 -> float16 (float16 accumulate)
 - if c is float32, operation is float16 @ float16 -> float32 (float32 accumulate)
+- if c is float16, operation is float16 @ float16 -> float16, and the ACCUMULATOR
+  is selected by the `accum` argument (see HGemmAccum in hgemm.cuh); it is fp32
+  unless the caller asks otherwise.
 */
 
 using bfloat16 = __nv_bfloat16;
+
+int hgemm_default_accum()
+{
+    static const int mode = []() -> int
+    {
+        const char* v = std::getenv("EXL3_HGEMM_FP16_ACCUM");
+        if (!v || !*v) return HGEMM_ACCUM_FP32;
+        char* end = nullptr;
+        long parsed = std::strtol(v, &end, 10);
+        if (end == v) return HGEMM_ACCUM_FP32;
+        switch (parsed)
+        {
+            case HGEMM_ACCUM_FP16: return HGEMM_ACCUM_FP16;
+            case HGEMM_ACCUM_FP32_FAST_16F: return HGEMM_ACCUM_FP32_FAST_16F;
+            default: return HGEMM_ACCUM_FP32;
+        }
+    }();
+    return mode;
+}
 
 static void hgemm_gemmex_impl
 (
     at::Tensor a,
     at::Tensor b,
     at::Tensor c,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int accum
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
@@ -59,20 +83,52 @@ static void hgemm_gemmex_impl
     void* ws = DevCtx::instance().get_ws(device);
     cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
 
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
+    // An fp16 accumulator only exists for an fp16 C: cublasGemmEx has no
+    // compute type that accumulates in half and stores float.
+    bool fp16_accum = output_fp16 && accum == HGEMM_ACCUM_FP16;
+
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
-    auto r = cublasGemmEx
-    (
-        cublas_handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        size_n, size_m, size_k,
-        &alpha_, b_ptr, CUDA_R_16F, size_n,
-                 a_ptr, CUDA_R_16F, size_k,
-        &beta_,  c.data_ptr(), c_type, (int) c_stride_m,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+    cublasStatus_t r;
+
+    if (fp16_accum)
+    {
+        // alpha/beta are read as the COMPUTE type, so CUBLAS_COMPUTE_16F wants
+        // half scalars — the float pair below would be misread as two halves.
+        // (This is the pair cublasHgemm took before 69c8ee8 folded the fp16
+        // path into cublasGemmEx.)
+        half alpha_ = __float2half(1.0f);
+        half beta_ = __float2half(0.0f);
+        r = cublasGemmEx
+        (
+            cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            size_n, size_m, size_k,
+            &alpha_, b_ptr, CUDA_R_16F, size_n,
+                     a_ptr, CUDA_R_16F, size_k,
+            &beta_,  c.data_ptr(), c_type, (int) c_stride_m,
+            CUBLAS_COMPUTE_16F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+    }
+    else
+    {
+        float alpha_ = 1.0f;
+        float beta_ = 0.0f;
+        cublasComputeType_t compute_type =
+            accum == HGEMM_ACCUM_FP32_FAST_16F ? CUBLAS_COMPUTE_32F_FAST_16F
+                                               : CUBLAS_COMPUTE_32F;
+        r = cublasGemmEx
+        (
+            cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            size_n, size_m, size_k,
+            &alpha_, b_ptr, CUDA_R_16F, size_n,
+                     a_ptr, CUDA_R_16F, size_k,
+            &beta_,  c.data_ptr(), c_type, (int) c_stride_m,
+            compute_type,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+    }
     cublas_check(r);
     cuda_check(cudaPeekAtLastError());
 }
@@ -82,11 +138,12 @@ void hgemm_gr
     at::Tensor a,
     at::Tensor b,
     at::Tensor c,
-    Graph* graph
+    Graph* graph,
+    int accum
 )
 {
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
-    hgemm_gemmex_impl(a, b, c, stream);
+    hgemm_gemmex_impl(a, b, c, stream, accum);
 
     if (graph) graph->need_cublas = true;
 }
@@ -95,8 +152,9 @@ void hgemm
 (
     at::Tensor a,
     at::Tensor b,
-    at::Tensor c
+    at::Tensor c,
+    int accum
 )
 {
-    hgemm_gr(a, b, c, nullptr);
+    hgemm_gr(a, b, c, nullptr, accum);
 }
