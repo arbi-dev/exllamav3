@@ -10,8 +10,10 @@
 /*
 
 Row-major matmul using cuBLAS, a @ b -> c
-- if c is float16, operation is float16 @ float16 -> float16 (float16 accumulate)
-- if c is float32, operation is float16 @ float16 -> float32 (float32 accumulate)
+- inputs are always float16; c may be float16 or float32
+- acc_mode selects the ACCUMULATOR independently of c's dtype:
+    0 -> CUBLAS_COMPUTE_32F  (fp32 accumulate)
+    1 -> CUBLAS_COMPUTE_16F  (fp16 accumulate; requires an fp16 c)
 */
 
 using bfloat16 = __nv_bfloat16;
@@ -21,7 +23,8 @@ static void hgemm_gemmex_impl
     at::Tensor a,
     at::Tensor b,
     at::Tensor c,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int acc_mode
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
@@ -59,18 +62,28 @@ static void hgemm_gemmex_impl
     void* ws = DevCtx::instance().get_ws(device);
     cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
 
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
+
+    // alpha/beta must be in the COMPUTE type, not always float: cuBLAS reads
+    // them through a pointer typed by the compute type, so handing a float* to
+    // a 16F compute reads two halves out of one float and scales by garbage.
+    TORCH_CHECK(acc_mode == 0 || acc_mode == 1, "acc_mode must be 0 (fp32) or 1 (fp16)");
+    TORCH_CHECK(acc_mode == 0 || output_fp16, "acc_mode 1 requires a float16 c");
+    cublasComputeType_t compute = acc_mode ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F;
+    float alpha_f = 1.0f, beta_f = 0.0f;
+    half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
+    const void* alpha_ = acc_mode ? (const void*) &alpha_h : (const void*) &alpha_f;
+    const void* beta_ = acc_mode ? (const void*) &beta_h : (const void*) &beta_f;
+
     auto r = cublasGemmEx
     (
         cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         size_n, size_m, size_k,
-        &alpha_, b_ptr, CUDA_R_16F, size_n,
-                 a_ptr, CUDA_R_16F, size_k,
-        &beta_,  c.data_ptr(), c_type, (int) c_stride_m,
-        CUBLAS_COMPUTE_32F,
+        alpha_, b_ptr, CUDA_R_16F, size_n,
+                a_ptr, CUDA_R_16F, size_k,
+        beta_,  c.data_ptr(), c_type, (int) c_stride_m,
+        compute,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
     cublas_check(r);
@@ -82,11 +95,12 @@ void hgemm_gr
     at::Tensor a,
     at::Tensor b,
     at::Tensor c,
-    Graph* graph
+    Graph* graph,
+    int acc_mode
 )
 {
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
-    hgemm_gemmex_impl(a, b, c, stream);
+    hgemm_gemmex_impl(a, b, c, stream, acc_mode);
 
     if (graph) graph->need_cublas = true;
 }
@@ -95,8 +109,9 @@ void hgemm
 (
     at::Tensor a,
     at::Tensor b,
-    at::Tensor c
+    at::Tensor c,
+    int acc_mode
 )
 {
-    hgemm_gr(a, b, c, nullptr);
+    hgemm_gr(a, b, c, nullptr, acc_mode);
 }
