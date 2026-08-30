@@ -29,10 +29,16 @@ EXL3 matmul, A @ B -> C
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
 - svh: optional, packed output scales/flips, shape (n//16), dtype float16
+- size_n_out: optional output width. 0 emits every column B stores. A positive value emits the
+  LEADING size_n_out columns of B and reads only the trellis blocks and svh entries they need,
+  so a caller wanting a narrow projection can pass the wide weight itself instead of a
+  materialized slice. B's k-row pitch stays the stored width either way
 
 limitations:
 - k % 16 == 0
 - n % 128 == 0
+- B contiguous. Its k-row pitch is taken from B.size(1), not from a stride, so a strided B
+  would read the wrong blocks with no shape check able to see it
 */
 
 std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
@@ -110,7 +116,8 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    int size_n_out
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -118,7 +125,24 @@ int exl3_gemm_gr
 
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
-    TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+    // The kernel derives B's k-row pitch from B.size(1) and indexes from B.data_ptr(); it takes
+    // no stride for B, so a strided view passes every shape check and then reads the wrong
+    // trellis blocks. Refuse it here rather than emit silently wrong output
+    TORCH_CHECK(B.is_contiguous(), "exl3_gemm: B must be contiguous");
+    int size_n_stored = B.size(1) * 16;
+    if (size_n_out)
+    {
+        TORCH_CHECK(size_n_out > 0 && size_n_out % 128 == 0,
+            "exl3_gemm: size_n_out must be a positive multiple of 128");
+        TORCH_CHECK(size_n_out <= size_n_stored,
+            "exl3_gemm: size_n_out exceeds the width B stores");
+        TORCH_CHECK(C.size(-1) == size_n_out,
+            "exl3_gemm: C width must equal size_n_out");
+    }
+    else
+    {
+        TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+    }
     // TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kShort);
@@ -158,7 +182,8 @@ int exl3_gemm_gr
     int dim = A.dim();
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
-    int size_n = B.size(1) * 16;
+    int size_n = size_n_out ? size_n_out : size_n_stored;
+    int size_n_b = size_n_stored;
 
     // Select kernel
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
@@ -170,7 +195,7 @@ int exl3_gemm_gr
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
     // to the regular kernel.
-    if (mul1 && exl3_gemv_int8_enabled())
+    if (mul1 && !size_n_out && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
@@ -191,7 +216,8 @@ int exl3_gemm_gr
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr
+        (void*)& svh_ptr,
+        (void*)& size_n_b
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -310,7 +336,8 @@ int exl3_gemm
     int force_shape_idx,
     bool mcg,
     bool mul1,
-    int force_num_sms
+    int force_num_sms,
+    int size_n_out
 )
 {
     return exl3_gemm_gr
@@ -325,7 +352,8 @@ int exl3_gemm
         mcg,
         mul1,
         force_num_sms,
-        nullptr
+        nullptr,
+        size_n_out
     );
 }
 

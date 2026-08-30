@@ -227,7 +227,8 @@ void exl3_gemv
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr
+        (void*)& svh_ptr,
+        (void*)& size_n  // size_n_b: this entry always emits every stored column
     };
 
     bool ok = exl3_gemv_try_launch

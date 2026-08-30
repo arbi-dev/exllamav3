@@ -177,7 +177,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
 
-    const int ntiles = size_n / 16;
+    // B's k-row pitch is the STORED weight width; size_n is how much of it this call emits
+    const int ntiles = size_n_b / 16;
     const int kslices = size_k / 16;
     const int num_groups = size_n / COLS;
 

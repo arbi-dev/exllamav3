@@ -24,7 +24,8 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     int* __restrict__ locks, \
     const half* __restrict__ suh, \
     half* __restrict__ A_had, \
-    const half* __restrict__ svh
+    const half* __restrict__ svh, \
+    const int size_n_b
 
 #define EXL3_MGEMM_ARGS \
     const half* __restrict__  A, \
