@@ -144,7 +144,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
-    m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm", &hgemm, "hgemm",
+          py::arg("a"), py::arg("b"), py::arg("c"), py::arg("acc_mode") = 0);
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
