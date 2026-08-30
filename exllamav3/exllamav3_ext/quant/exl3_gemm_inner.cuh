@@ -29,6 +29,7 @@ void exl3_gemm_kernel_inner
     const int size_m,
     const int size_k,
     const int size_n,
+    const int size_n_b,
     int* __restrict__ locks,
     const half* post_scale
 )
@@ -94,6 +95,10 @@ void exl3_gemm_kernel_inner
     //int blocks_m = 1;
     //int blocks_k = tiles_k * TILEBLOCKS_K;
     int blocks_n = tiles_n * TILEBLOCKS_N;
+    // B's row pitch along k is the width of the STORED weight, which is size_n only when the
+    // caller computes every output column. A caller that asks for a leading window of a wider
+    // weight passes the stored width here and the tile walk above still spans size_n
+    int blocks_n_b = size_n_b / 16;
 
     // Start and end index of current slice, must span at least one tile
     int num_slices = gridDim.x;
@@ -135,7 +140,7 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = m < size_m;
     }
 
-    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n_b * TILEBLOCKS_K * 256 / 16 * bits;
     const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
     const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
@@ -148,7 +153,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n_b * 256 / 16 * bits / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 

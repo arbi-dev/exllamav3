@@ -126,6 +126,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     MIN(size_m, 16),    \
                     hidden_dim,         \
                     intermediate_dim,   \
+                    intermediate_dim,   \
                     locks,              \
                     nullptr
                 #define SHAPE_ARGS      \
@@ -199,6 +200,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     out_addr,           \
                     MIN(size_m, 16),    \
                     intermediate_dim,   \
+                    hidden_dim,         \
                     hidden_dim,         \
                     locks,              \
                     nullptr

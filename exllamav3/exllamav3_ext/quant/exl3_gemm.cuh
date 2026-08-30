@@ -15,7 +15,8 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    int size_n_out = 0
 );
 
 int exl3_gemm
@@ -29,7 +30,8 @@ int exl3_gemm
     int force_shape_idx,
     bool mcg,
     bool mul1,
-    int force_num_sms
+    int force_num_sms,
+    int size_n_out = 0
 );
 
 int exl3_mgemm_gr
