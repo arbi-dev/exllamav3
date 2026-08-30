@@ -67,6 +67,115 @@ def auto_reconstruct_threshold(out_features: int) -> int:
         return NARROW_RECONSTRUCT_THRESHOLD
     return AUTO_RECONSTRUCT_THRESHOLD
 
+
+# Both kernel axes must be whole Hadamard blocks or reconstruct_had_slice
+# refuses the shape. EXL3 tensors are had-transformed on both sides at quant
+# time so this always holds, and TP shards cut on whole blocks, but the gate
+# below is mirrored by out-of-tree callers on the PADDED kernel dims, so the
+# width has a name rather than being spelled 128 at each use.
+FUSED_RECONSTRUCT_BLOCK = 128
+
+# THE FUSED RECONSTRUCT'S ROW GATE, ONE VALUE PER OUTPUT-WIDTH CLASS.
+#
+# reconstruct_had_slice emits the dequantized weight already rotated by both
+# 128-wide Hadamards and scaled by suh/svh, so the gemm consumes the raw
+# activation and produces the final output: the two standalone had_r_128
+# launches and the activation-sized scratch between them disappear. The saving
+# is activation traffic, which scales with rows; the extra cost is weight-
+# shaped, which does not. Hence a row threshold.
+#
+# WHAT THE OLD SINGLE CONSTANT (1024) RESTED ON, AND WHY IT IS WRONG.
+# It was justified here as "the fused kernel costs ~4x plain reconstruct
+# (k*n-proportional) while the saved had launches scale with rows*(k+n);
+# breakeven is rows ~400-900 across shapes". The first half is false, and it is
+# the half that sets the shape of the answer. Timed with the two reconstruct
+# kernels ALONE, no activation in the frame, round-robin and L2-flushed against
+# a null control (arbi-serve tools/exl3_largem_dispatch_bench.py
+# --reconstruct-probe, arbicity/arbi-serve#1755, 1x RTX 4090, 4.0bpw 27B):
+#
+#     5120x1024    0.0144 -> 0.0236 ms   1.64x   +9.2 us
+#     6144x5120    0.0911 -> 0.0973      1.07x   +6.1
+#     17408x5120   0.2509 -> 0.2580      1.03x   +7.2
+#     5120x10240   0.1505 -> 0.1577      1.05x   +7.2
+#     5120x12288   0.1784 -> 0.1925      1.08x   +14.1
+#     5120x17408   0.2518 -> 0.2632      1.05x   +11.4
+#     5120x248320  3.8765 -> 3.9700      1.02x   +93.6  (8 slices, ~12 us each)
+#
+# Not 4x, and not proportional to k*n: 6-14 us PER LAUNCH across a 17x range of
+# weight sizes. A near-FIXED cost against a saving LINEAR in rows crosses far
+# earlier than a k*n-proportional one, and it crosses at a different row count
+# for a shape that pays the cost once per slice than for one that pays it once.
+# One scalar cannot express that, which is why this is a function of the output
+# width -- keyed on the same two bounds auto_reconstruct_threshold already
+# splits on, so a caller mirroring both gates asks one question about a shape
+# and not two. Both bounds are multiples of FUSED_RECONSTRUCT_BLOCK, so they
+# read the same on a Hadamard-padded out_features as on the declared one.
+#
+# The values are the LOWEST ROW COUNT AT WHICH THE SWEEP OBSERVED THE FUSED
+# VARIANT WINNING, never an interpolated crossing: both variants driven through
+# the real dispatch with only this gate moved, a kernel-counting pass
+# certifying which variant each row count reached before its timing is trusted,
+# paired per-round deltas with a sign-agreement count, against a null control
+# that is the standalone arm run twice (--fused-crossover, same PR).
+
+# WIDE, SINGLE-SLICE -- 5120x17408, 17408x5120, 6144x5120, 5120x10240,
+# 5120x12288, i.e. 95% of a prefill chunk's linear FLOPs. THE GATE HAS NO
+# CORRECT POSITIVE VALUE HERE: the fused variant already wins at 64 rows on the
+# three widest and by 128 rows on the rest, while auto_reconstruct_threshold
+# does not admit this leg at all below 281 rows. The crossover is below the row
+# count at which the leg is reachable, so the gate is not conservative, it is
+# only ever wrong -- over 281-1023 rows the old constant gave up 2.3-9.0% with
+# an fp32 cuBLAS accumulator and 3.3-14.5% with fp16. 0 also deletes a
+# row-keyed algorithm switch from the class that carries almost all of prefill,
+# which is a determinism property and not only a speed one.
+WIDE_FUSED_RECONSTRUCT_THRESHOLD = 0
+
+# NARROW (out_features <= NARROW_RECONSTRUCT_MAX_N) -- 5120x1024, the k_proj /
+# v_proj that write the KV. The one class where a row gate on this leg earns
+# its existence: the fused variant LOSES here below the crossing, by up to 18%
+# at 65-96 rows, because a 1024-wide weight makes the per-launch cost a large
+# fraction of the whole reconstruct (the 1.64x row of the probe above). The
+# crossing brackets 400-500; 512 is the lowest row count at which the fused
+# variant was measured to win rather than interpolated to (+9.0% fp32 / +7.4%
+# fp16, rising to +19.3% / +20.7% by 1023 rows). The bracket's interior is not
+# taken because the error is asymmetric on exactly this class -- early is a
+# measured loss on the linears whose output is the KV, late is a bounded
+# forfeit over 400-512 rows.
+NARROW_FUSED_RECONSTRUCT_THRESHOLD = 512
+
+# WIDE, N-SLICED (out_features > MAX_RECONSTRUCT_SLICE_N) -- the 5120x248320
+# head, 8 slices. Same per-launch cost as the wide single-slice class but paid
+# once PER SLICE, so it crosses later: bracket ~300-350, and 384 is the lowest
+# measured win (+0.6%, rising to +5.2% by 1023 rows). The gains are small
+# because the head's gemm dominates its own reconstruct; the value is here so
+# the class is decided by its own measurement rather than by the wide class's.
+SLICED_FUSED_RECONSTRUCT_THRESHOLD = 384
+
+
+def fused_reconstruct_threshold(out_features: int) -> int:
+    """Rows at or above which this linear should take the FUSED reconstruct.
+
+    A function of the output width for the same reason
+    auto_reconstruct_threshold is one, and split on the same two bounds: the
+    cost this trades away is per-kernel-launch, so it lands differently on a
+    narrow weight (where it is a large fraction of the reconstruct), on a wide
+    one (where it is noise), and on one wide enough to be sliced (where it is
+    paid once per slice). See the measurements above each value.
+
+    ``out_features`` may be the declared width or the Hadamard-padded kernel
+    width; both bounds are multiples of FUSED_RECONSTRUCT_BLOCK, so the two
+    cannot disagree. Callers that mirror this dispatch (arbi-serve's custom op
+    does, to own its output buffer under cudagraph capture) must call this and
+    never restate it -- a divergence here is a different ALGORITHM on the same
+    rows, not a rounding difference.
+    """
+    if out_features <= NARROW_RECONSTRUCT_MAX_N:
+        return NARROW_FUSED_RECONSTRUCT_THRESHOLD
+    if out_features > MAX_RECONSTRUCT_SLICE_N:
+        return SLICED_FUSED_RECONSTRUCT_THRESHOLD
+    return WIDE_FUSED_RECONSTRUCT_THRESHOLD
+
+
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
 class LinearEXL3:
@@ -232,13 +341,13 @@ class LinearEXL3:
         # tensors: both sides are had-transformed at quant time)
         if self._fused_reconstruct is None:
             self._fused_reconstruct = (
-                self.in_features % 128 == 0 and self.out_features % 128 == 0
+                self.in_features % FUSED_RECONSTRUCT_BLOCK == 0
+                and self.out_features % FUSED_RECONSTRUCT_BLOCK == 0
                 and not no_fused_reconstruct
             )
 
-        # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
-        # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
-        use_fused = self._fused_reconstruct and rows >= 1024
+        # Row gate, per output-width class — see fused_reconstruct_threshold
+        use_fused = self._fused_reconstruct and rows >= fused_reconstruct_threshold(self.out_features)
 
         if use_fused:
             xh = x
