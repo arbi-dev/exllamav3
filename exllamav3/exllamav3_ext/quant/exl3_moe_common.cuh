@@ -10,6 +10,20 @@
 #define MOE_SMS_PER_EXPERT 8       // default/minimum group width, also sets max concurrency (buffer count)
 #define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active
 #define MOE_TILESIZE_K 32
+// Raising this ALONE makes the kernel slower, which is why it has stood at 16. It is not a
+// shape knob: exl3_moe_kernel.cuh passes it as the tile's TILESIZE_M but hardcodes the row
+// count three more times at each of the two GEMM call sites -- MIN(size_m, 16) as the rows
+// handed to the inner kernel, and `+= 16 * dim` / `size_m -= 16` as the stride between
+// strips. Raise the constant and the kernel builds a deeper tile, is still fed 16 rows, and
+// still advances 16 rows: TILEBLOCKS_M row blocks of MMA and registers per strip, one of them
+// carrying output, and the trellis re-decoded every 16 rows exactly as before. Every row block
+// past the filled one is charged in full -- measured at ~17.4 us per 16-row block on a 4090 at
+// 5120x17408, ~96% of the tensor roofline for those rows -- so 32 costs about 13% more than 16
+// for nothing.
+//
+// It CAN move, but only with all four numbers together. Worth doing when a census of the
+// deployed routing shows experts routinely receiving more than 16 tokens per step; below that
+// the deeper tile has no second row block to fill and is pure loss.
 #define MOE_TILESIZE_M 16
 #define MOE_SH_STAGES 3
 #define MOE_FRAG_STAGES 3
