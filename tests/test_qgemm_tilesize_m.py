@@ -24,11 +24,22 @@ SHAPES = {
     8: (48, 16, 128),
     9: (64, 16, 128),
     10: (32, 16, 512),
+    11: (80, 16, 128),
+    12: (96, 16, 128),
 }
 
 # A multi-row-block shape and the 16-row shape it is a pure restriping of: same TILESIZE_K
 # (same sub-k reduction) and same TILESIZE_N (same warp-to-column assignment)
-IDENTICAL_PAIRS = [(5, 2), (7, 1), (8, 1), (9, 1), (10, 4)]
+# Shapes 11 and 12 are the two DEEPEST tiles in the table and the ones the
+# autotuner resolves to across most of the served row range, and they landed
+# without an entry here at all -- so the deepest restripings the engine
+# actually runs had no bit-identity coverage. They restripe shape 1 for the
+# same reason shapes 7, 8 and 9 do: same TILESIZE_K (same sub-k reduction) and
+# same TILESIZE_N (same warp-to-column assignment). They also differ from
+# their partner in FRAG_STAGES (2 against 1's 5), which is a pipeline depth and
+# not a reduction order, so the requirement is still bit-identity and not a
+# tolerance
+IDENTICAL_PAIRS = [(5, 2), (7, 1), (8, 1), (9, 1), (10, 4), (11, 1), (12, 1)]
 
 # Shape 6 (32, 16, 256) has no 16-row partner: the table holds no (16, 16, 256), and the
 # natural M=32 twin of shape 3 -- (32, 32, 256) -- spills past the 128-register cap that
@@ -39,8 +50,13 @@ NO_IDENTICAL_PARTNER = {6: 3}
 MAX_M = max(m for m, _, _ in SHAPES.values())
 
 # Spans a first row block that is full and partial, the last row block full and partial for
-# every TILESIZE_M in the table, and strip boundaries above each of them
-ROWS = [17, 20, 24, 25, 26, 31, 32, 33, 48, 49, 64, 65, 80, 96, 112, 127, 128, 144, 160]
+# every TILESIZE_M in the table, and strip boundaries above each of them. 81, 97, 176 and 192
+# are what the 80- and 96-row tiles need: a strip holding one row block, a strip holding
+# TILEBLOCKS_M + 1 rows, and the second strip boundary of each
+ROWS = [
+    17, 20, 24, 25, 26, 31, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112,
+    127, 128, 144, 160, 176, 192,
+]
 SIZES = [(5120, 5120), (5120, 13824), (2048, 7168)]
 
 _NUM_SHAPES = ext.exl3_gemm_num_kernel_shapes()
@@ -136,7 +152,7 @@ def test_multi_row_block_matches_partner_bitwise_fp32_out(
 ):
     k, n, bits = 5120, 5120, 4
     trellis, suh, svh, a_all = _operands(k, n, bits, 7, device)
-    for rows in [17, 32, 33, 64, 65, 144]:
+    for rows in [17, 32, 33, 64, 65, 81, 97, 144, 192]:
         a = a_all[:rows]
         ref = _gemm(a, trellis, suh, svh, ref_shape, torch.float32, n)
         got = _gemm(a, trellis, suh, svh, new_shape, torch.float32, n)
