@@ -88,6 +88,16 @@ void exl3_gemm_kernel_inner
     int warp_id = t / 32;
     int lane_id = t % 32;
 
+    // Row blocks the caller actually filled. A batch's final strip is partial,
+    // and a row block past it holds no output any store will reach -- every
+    // global write and every reduction stage is already guarded on size_m -- so
+    // its ldsm4 and its MMAs compute products nothing reads. The A rows they
+    // read are stale shared memory in the first place: the cp_async that fills
+    // them is predicated on m < size_m. Uniform across the CTA, so the guards
+    // below predicate rather than diverge, and the output is unchanged bit for
+    // bit rather than within a tolerance
+    const int m_blocks = CEIL_DIVIDE(size_m, 16);
+
     // Dimensions
     //int tiles_m = CEIL_DIVIDE(size_m, TILESIZE_M);
     int tiles_k = size_k / TILESIZE_K;
@@ -295,6 +305,7 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
             {
+                if constexpr (TILEBLOCKS_M > 1) if (m >= m_blocks) continue;
                 int R = r + m * 16;
                 int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
                 ldsm4(frag_a[buf][m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
@@ -681,6 +692,7 @@ void exl3_gemm_kernel_inner
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
             {
+                if constexpr (TILEBLOCKS_M > 1) if (m >= m_blocks) continue;
                 #if EXL3_GEMM_H_ACC
                     ptx_mma_m16n8k16(frag_a[buf][m], frag_b[buf][n], frag_c_h[m][n]);
                 #else
