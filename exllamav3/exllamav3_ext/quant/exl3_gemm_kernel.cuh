@@ -5,8 +5,22 @@
 #include "exl3_gemm_inner.cuh"
 #include "exl3_devctx.cuh"
 
+// The minBlocksPerMultiprocessor argument is 1 because it is a FACT about this
+// kernel, not a preference: every launch site asks for SMEM_MAX bytes of
+// dynamic shared memory -- cudaFuncSetAttribute raises the cap to it and both
+// cudaLaunchCooperativeKernel and the autotuner pass it as the launch's shared
+// size -- and SMEM_MAX is 90 KB against 100 KB per SM on sm_86/sm_89. One block
+// per SM is the only occupancy this kernel can ever reach.
+//
+// ptxas cannot see the dynamic allocation. Left to guess, it budgets registers
+// for an occupancy the launch will never grant and spills instead: shape 7
+// (32,16,128) spills 12-32 B in gemm and 64-80 B in mgemm at K3 and K5, and a
+// (16,16,256) shape cannot be built at all. Stating the occupancy makes both
+// spill-free at every K, codebook and accumulator width, and no shape that was
+// already clean gets worse.
+
 template<EXL3_GEMM_T_ARGS>
-__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16, 1)
 void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 {
     auto grid = cg::this_grid();
@@ -80,7 +94,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 }
 
 template<EXL3_GEMM_T_ARGS>
-__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16, 1)
 void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 {
     int bszm = MAX(bszm_in, bszm_out);
