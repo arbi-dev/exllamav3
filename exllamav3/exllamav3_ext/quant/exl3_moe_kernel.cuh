@@ -13,6 +13,7 @@
 #include "exl3_gemm_inner.cuh"
 #include "exl3_devctx.cuh"
 #include "../ptx.cuh"
+#include "had_scale.h"
 
 template<int t_bits, int MOE_TILESIZE_N, int cb>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
@@ -98,14 +99,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                         in_ptr,
                         temp_state_g + 128 * warp_idx,
                         exp_gate_suh + 128 * token_off,
-                        0.088388347648f
+                        exl3_had::HAD_R_SCALE
                     );
                 had_hf_r_128_inner<true, false>
                 (
                     in_ptr,
                     temp_state_u + 128 * warp_idx,
                     exp_up_suh + 128 * token_off,
-                    0.088388347648f
+                    exl3_had::HAD_R_SCALE
                 );
             }
             group_barrier(group_idx, group_size, barrier_counters_sense);
@@ -178,7 +179,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     exp_gate_svh + 128 * token_off,
                     exp_up_svh + 128 * token_off,
                     exp_down_suh + 128 * token_off,
-                    0.088388347648f,
+                    exl3_had::HAD_R_SCALE,
                     act_limit,
                     act_function
                 );
@@ -253,7 +254,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     temp_state_g + 128 * warp_idx,
                     out_ptr,
                     exp_down_svh + 128 * token_off,
-                    0.088388347648f * __half2float(weight)
+                    exl3_had::HAD_R_SCALE * __half2float(weight)
                 );
             }
         };

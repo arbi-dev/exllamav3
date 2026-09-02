@@ -26,6 +26,7 @@
 #include "exl3_dq.cuh"
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
+#include "had_scale.h"
 
 #define EXL3_GEMV_MAX_M 8
 
@@ -167,7 +168,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 A + this_warp * 128,
                 A_had + this_warp * 128,
                 suh + (this_warp * 128) % size_k,
-                0.088388347648f  // 1/sqrt(128)
+                exl3_had::HAD_R_SCALE
             );
 
         grid.sync();
@@ -388,7 +389,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     ((const float*) C) + this_warp * 128,
                     ((float*) C) + this_warp * 128,
                     svh + (this_warp * 128) % size_n,
-                    0.088388347648f  // 1/sqrt(128)
+                    exl3_had::HAD_R_SCALE
                 );
             else
                 had_hf_r_128_inner<false, true>
@@ -396,7 +397,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     ((const half*) C) + this_warp * 128,
                     ((half*) C) + this_warp * 128,
                     svh + (this_warp * 128) % size_n,
-                    0.088388347648f  // 1/sqrt(128)
+                    exl3_had::HAD_R_SCALE
                 );
         }
     }

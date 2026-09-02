@@ -14,6 +14,7 @@
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
+#include "had_scale.h"
 
 namespace cg_gemv = cooperative_groups;
 
@@ -754,9 +755,9 @@ __device__ __forceinline__ void gemv_int8_epilogue
         __syncwarp();
         // gridDim.y == 1, so the inner's blockIdx.y-based scale offset is zero; pre-offset svh
         if constexpr (c_fp32)
-            had_ff_r_128_inner<false, true>(tmp, ((float*) C_row) + base, svh + base, 0.088388347648f * output_scale);
+            had_ff_r_128_inner<false, true>(tmp, ((float*) C_row) + base, svh + base, exl3_had::HAD_R_SCALE * output_scale);
         else
-            had_fh_r_128_inner<false, true>(tmp, ((half*) C_row) + base, svh + base, 0.088388347648f * output_scale);
+            had_fh_r_128_inner<false, true>(tmp, ((half*) C_row) + base, svh + base, exl3_had::HAD_R_SCALE * output_scale);
         __syncwarp();
     }
 }
@@ -820,7 +821,7 @@ __device__ __forceinline__ void gemv_int8_stage_slice
         }
         const half* Ar = A + (size_t) r * size_k;
         for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5)
-            had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+            had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), exl3_had::HAD_R_SCALE);
         __syncthreads();
 
         float mx = 0.0f;
@@ -941,9 +942,9 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
         tmp[lane * 4 + i] = k_inv * acc[i] + corr;
     __syncwarp();
     if constexpr (c_fp32)
-        had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
+        had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, exl3_had::HAD_R_SCALE);
     else
-        had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
+        had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, exl3_had::HAD_R_SCALE);
 }
 
 // Shared-memory cap for the sq decomposition: row halfs (32 B/row) + M splat regions (64 B/row each,
@@ -1081,7 +1082,7 @@ void exl3_gemv_int8_coop_kernel
                 A + this_warp * 128,
                 A_had + this_warp * 128,
                 suh + (this_warp * 128) % size_k,
-                0.088388347648f
+                exl3_had::HAD_R_SCALE
             );
             if (size_m == 1)
             {
