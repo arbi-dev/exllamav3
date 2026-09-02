@@ -43,6 +43,7 @@ limitations:
 
 std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
 
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -692,4 +693,14 @@ int exl3_mgemm
         size_n_list,
         c_ptrs
     );
+}
+
+void exl3_set_parallel_fixup(int64_t device, bool enable)
+{
+    DevCtx::instance().set_gemm_parallel_fixup((int) device, enable ? 1 : 0);
+}
+
+bool exl3_parallel_fixup_available(int64_t device)
+{
+    return DevCtx::instance().gemm_fixup_arena((int) device);
 }

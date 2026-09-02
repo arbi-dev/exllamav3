@@ -37,7 +37,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true, true>
         (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, size_n_b, locks, svh);
 
         A_ += TILESIZE_M * size_k;
@@ -217,7 +217,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 int lock_offs = blockIdx.z * size_n / 128;
 
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false, false>
                 (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, n_j, locks + lock_offs, nullptr);
             }
 

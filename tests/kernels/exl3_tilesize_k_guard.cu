@@ -21,6 +21,6 @@ __global__ void probe_tilesize_k
     int size_m, int size_k, int size_n, int* locks, const half* post_scale
 )
 {
-    exl3_gemm_kernel_inner<4, false, 0, 16, PROBE_TILESIZE_K, 128, 4, 3, true>
+    exl3_gemm_kernel_inner<4, false, 0, 16, PROBE_TILESIZE_K, 128, 4, 3, true, false>
         (A, B, C, size_m, size_k, size_n, locks, post_scale);
 }
