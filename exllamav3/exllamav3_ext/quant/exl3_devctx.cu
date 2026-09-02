@@ -62,11 +62,22 @@ int* DevCtx::get_locks(int device)
     if (!locks[device])
     {
         cudaSetDevice(device);
-        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + MGEMM_SLOTS_INTS) * sizeof(int);
+        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + MGEMM_SLOTS_INTS + EXL3_GEMM_FIXUP_INTS) * sizeof(int);
         cudaMalloc(&locks[device], size);
         cudaMemset(locks[device], 0, size);
     }
     return (int*) locks[device];
+}
+
+// Written once per device, before any launch that reads it, so the value the kernel sees is the
+// same for every CTA of every launch in a process. A per-call switch would let two calls at the
+// same shape reduce in different orders, which is the row-keyed dependence the shape pin exists
+// to remove
+void DevCtx::set_gemm_parallel_fixup(int device, int enable)
+{
+    int* base = get_locks(device);
+    std::lock_guard<std::mutex> lock(mtx);
+    cudaMemcpy(base + EXL3_GEMM_FIXUP_ENABLE_OFFSET, &enable, sizeof(int), cudaMemcpyHostToDevice);
 }
 
 int g_get_cc(int device)

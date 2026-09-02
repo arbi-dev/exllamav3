@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../ptx.cuh"
+#include "exl3_devctx.cuh"
 
 // Constants
 #define EXL3_GEMM_BASE_THREADS 256
@@ -19,7 +20,7 @@
     #define EXL3_GEMM_H_ACC 0
 #endif
 
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool fixup_capable>
 inline __device__
 void exl3_gemm_kernel_inner
 (
@@ -106,6 +107,23 @@ void exl3_gemm_kernel_inner
     int slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
+
+    // Parallel fixup eligibility. Uniform across the grid: every term is a launch constant or a
+    // compile-time tile constant, so no two CTAs of one launch can disagree about which reduction
+    // they are running. `run_bound <= tiles_k` is what makes two staging slots per CTA enough --
+    // a run no longer than one column straddles at most one column boundary, so a CTA stages at
+    // most one partial per column and the two columns it can touch have different parity
+    const int FIXUP_TILE_FLOATS = TILESIZE_M * TILESIZE_N;
+    float* fixup_arena = (float*) (locks + EXL3_GEMM_FIXUP_OFFSET);
+    bool use_fixup = false;
+    if constexpr (fixup_capable)
+    {
+        int run_bound = CEIL_DIVIDE(tiles_k * tiles_n, num_slices);
+        use_fixup =
+            locks[EXL3_GEMM_FIXUP_ENABLE_OFFSET] != 0 &&
+            run_bound <= tiles_k &&
+            (size_t) 2 * num_slices * FIXUP_TILE_FLOATS <= (size_t) EXL3_GEMM_FIXUP_FLOATS;
+    }
 
     auto index_m = [&] (int slice_i) { return 0; }; //blockIdx.y; };
     auto index_k = [&] (int slice_i) { return (slice_i % tiles_k); };
@@ -596,6 +614,73 @@ void exl3_gemm_kernel_inner
         }
     };
 
+    // Stage this CTA's partial into its own arena slot, and fold a slot back. Always fp32: the
+    // chain's intermediates round-trip through C's dtype, so at fp16 C a chain of length L costs
+    // L-1 roundings of the running sum. The arena is float regardless of C, so the fixup pays none
+    auto stage_slot = [&] (int b) -> float*
+    {
+        return fixup_arena + ((size_t) (2 * b + (slice2_n & 1))) * FIXUP_TILE_FLOATS;
+    };
+
+    auto write_stage = [&] (float* base)
+    {
+        int n0 = warp_id * FRAGS_N_PER_WARP;
+        #pragma unroll
+        for (int m = 0; m < TILEBLOCKS_M; ++m)
+        #pragma unroll
+        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+        {
+            int r0 = m * 16 + lane_id / 4;
+            int r1 = r0 + 8;
+            int c = (lane_id % 4) * 2;
+            if (r0 < size_m)
+            {
+                float* p = base + r0 * TILESIZE_N + (n0 + n) * 8 + c;
+                *p++ = frag_c[m][n][0];
+                *p   = frag_c[m][n][1];
+            }
+            if (r1 < size_m)
+            {
+                float* p = base + r1 * TILESIZE_N + (n0 + n) * 8 + c;
+                *p++ = frag_c[m][n][2];
+                *p   = frag_c[m][n][3];
+            }
+        }
+    };
+
+    auto add_stage = [&] (const float* base)
+    {
+        int n0 = warp_id * FRAGS_N_PER_WARP;
+        #pragma unroll
+        for (int m = 0; m < TILEBLOCKS_M; ++m)
+        #pragma unroll
+        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+        {
+            int r0 = m * 16 + lane_id / 4;
+            int r1 = r0 + 8;
+            int c = (lane_id % 4) * 2;
+            if (r0 < size_m)
+            {
+                const float* p = base + r0 * TILESIZE_N + (n0 + n) * 8 + c;
+                frag_c[m][n][0] += *p++;
+                frag_c[m][n][1] += *p;
+            }
+            if (r1 < size_m)
+            {
+                const float* p = base + r1 * TILESIZE_N + (n0 + n) * 8 + c;
+                frag_c[m][n][2] += *p++;
+                frag_c[m][n][3] += *p;
+            }
+        }
+    };
+
+    // The CTA covering unit i of the flattened (n-tile, k-tile) space, i.e. the inverse of
+    // slice_beg(b) = tiles_k * tiles_n * b / num_slices
+    auto block_of_unit = [&] (int i) -> int
+    {
+        return (int) (((long long) (i + 1) * num_slices - 1) / (long long) (tiles_k * tiles_n));
+    };
+
     // Output reduction
     auto reduce = [&] ()
     {
@@ -622,13 +707,52 @@ void exl3_gemm_kernel_inner
         int lock_d = slice2_k - slice2_k0 + 1;
         int* lock = &locks[slice_m * blocks_n + slice2_n];
 
-        barrier_acquire(lock, lock_i);
-
         bool first = lock_i == 0;
         bool last = lock_i + lock_d == tiles_k;
 
+        // Stream-K parallel fixup. The chain below combines partials one CTA at a time, each hop a
+        // global write, an acquire-spin and a read back, L = num_slices / tiles_n deep. Every
+        // contributor here instead stages its partial into its own arena slot and leaves; the CTA
+        // covering k-tile 0 -- which is `last`, and the lowest blockIdx.x in the column -- waits
+        // ONCE and folds the rest. Same traffic, two round trips of latency instead of L.
+        //
+        // The fold order is a pure function of the partition, not of arrival: own partial, then
+        // descending blockIdx.x, which is descending k. It is NOT the chain's association (the
+        // chain folds left in descending k and rounds the running sum to C's dtype at every hop),
+        // so this changes the bits. It is deterministic either way, which is the property the
+        // shape pin rests on
+        bool fixed_up = false;
+        if (use_fixup && !(first && last))
+        {
+            int b_hi = block_of_unit((slice2_n + 1) * tiles_k - 1);
+            if (!last)
+            {
+                if (!sub_k) write_stage(stage_slot(blockIdx.x));
+                __syncthreads();
+                if (threadIdx.x == 0)
+                {
+                    asm volatile ("fence.acq_rel.gpu;\n");
+                    asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(lock_d));
+                }
+                clear_frag_c();
+                return;
+            }
+            else
+            {
+                // Everyone above k-tile 0 has contributed exactly tiles_k - lock_d k-tiles
+                barrier_acquire(lock, tiles_k - lock_d);
+                if (!sub_k)
+                    for (int b = b_hi; b > (int) blockIdx.x; --b)
+                        add_stage(stage_slot(b));
+                fixed_up = true;
+            }
+        }
+
+        if (!fixed_up)
+            barrier_acquire(lock, lock_i);
+
         // Second and subsequent threadblocks in column read back the intermediate sum from global memory
-        if (!sub_k && !first)
+        if (!sub_k && !first && !fixed_up)
         {
             read_sum_gl();
         }

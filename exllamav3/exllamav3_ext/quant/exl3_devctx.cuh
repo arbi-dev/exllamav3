@@ -21,6 +21,24 @@
 #define MGEMM_SLOTS_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
 #define MGEMM_SLOTS_INTS (1 + MGEMM_CHUNKS + MGEMM_MAX_SLOTS)
 
+// Stream-K parallel-fixup staging, after the mgemm slot list, in the same per-device buffer the
+// locks live in so no kernel signature carries a second pointer. [0] is the enable word the host
+// writes once from EXL3_GEMM_PARALLEL_FIXUP; the rest is the partial-tile arena.
+//
+// The arena is a fixed VRAM budget rather than a per-shape allocation because the buffer is
+// allocated once per device and a captured graph bakes the pointer: a grow-on-demand arena would
+// either dangle or make the eligible shape set depend on the order shapes were first seen, which
+// is a boot-order-keyed numerics dependence. A shape whose staging does not fit the budget falls
+// back to the ordered chain; the kernel evaluates that predicate itself from gridDim and its own
+// tile constants, so host and device cannot disagree about which reduction ran.
+#define EXL3_GEMM_FIXUP_ENABLE_OFFSET (MGEMM_SLOTS_OFFSET + MGEMM_SLOTS_INTS)
+#define EXL3_GEMM_FIXUP_BYTES (4*1024*1024)
+#define EXL3_GEMM_FIXUP_FLOATS (EXL3_GEMM_FIXUP_BYTES / 4)
+// Rounded to a 16-byte boundary: the staging stores two adjacent floats per fragment element and
+// the compiler is free to merge them into one 8-byte store, which faults on a 4-byte-aligned base
+#define EXL3_GEMM_FIXUP_OFFSET (((EXL3_GEMM_FIXUP_ENABLE_OFFSET + 1) + 3) & ~3)
+#define EXL3_GEMM_FIXUP_INTS (4 + EXL3_GEMM_FIXUP_FLOATS)
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 
@@ -47,6 +65,7 @@ public:
     int get_cc(int device);
     void* get_ws(int device);
     int* get_locks(int device);
+    void set_gemm_parallel_fixup(int device, int enable);
 
 private:
     DevCtx() = default;

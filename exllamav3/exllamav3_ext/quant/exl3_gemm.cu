@@ -43,6 +43,22 @@ limitations:
 
 std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
 
+// EXL3_GEMM_PARALLEL_FIXUP: replace the ordered chain that combines a column's k-partials with a
+// stream-K parallel fixup (see exl3_gemm_inner.cuh). Read ONCE per process and published ONCE per
+// device, never per call: the two reductions associate differently, so a per-call switch would let
+// two calls at the same shape return different bits
+bool gemm_parallel_fixup_enabled()
+{
+    static const int cached = []
+    {
+        const char* e = getenv("EXL3_GEMM_PARALLEL_FIXUP");
+        return (e && e[0] && e[0] != '0') ? 1 : 0;
+    }();
+    return cached != 0;
+}
+
+bool gemm_fixup_published[MAX_DEVICES] = {};
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -171,6 +187,11 @@ int exl3_gemm_gr
     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
+    if (!gemm_fixup_published[device])
+    {
+        DevCtx::instance().set_gemm_parallel_fixup(device, gemm_parallel_fixup_enabled() ? 1 : 0);
+        gemm_fixup_published[device] = true;
+    }
 
     // Dispatch
     int K = B.size(2) / 16;
@@ -500,6 +521,11 @@ int exl3_mgemm_gr
     int num_sms = force_num_sms ? force_num_sms : total_sms;
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
+    if (!gemm_fixup_published[device])
+    {
+        DevCtx::instance().set_gemm_parallel_fixup(device, gemm_parallel_fixup_enabled() ? 1 : 0);
+        gemm_fixup_published[device] = true;
+    }
 
     // Dispatch
     const half* A_ptr = (const half*) A.data_ptr();
