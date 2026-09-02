@@ -45,7 +45,14 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         else                  C_ = (void*) (((half*) C_) + TILESIZE_M * size_n);
         size_m_ -= TILESIZE_M;
 
-        if (size_m_ > 0 || svh)
+        // Orders the NEXT M-tile against this one: the tiles share the split-K lock
+        // array and the C staging they fold through, so a block must not open tile
+        // t+1 while a peer is still draining tile t. Nothing grid-wide reads C after
+        // the LAST tile -- the output Hadamard and svh scale are applied to each
+        // finished tile inside the mainloop (exl3_gemm_inner.cuh, shmem_out_had,
+        // which this kernel instantiates true) -- so the barrier is a function of
+        // the tile count alone and not of whether an output scale is present.
+        if (size_m_ > 0)
             grid.sync();
     }
 
