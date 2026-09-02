@@ -108,11 +108,13 @@ void exl3_gemm_kernel_inner
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
 
-    // Parallel fixup eligibility. Uniform across the grid: every term is a launch constant or a
+    // Parallel fixup eligibility. Uniform across the grid -- every term is a launch constant or a
     // compile-time tile constant, so no two CTAs of one launch can disagree about which reduction
-    // they are running. `run_bound <= tiles_k` is what makes two staging slots per CTA enough --
-    // a run no longer than one column straddles at most one column boundary, so a CTA stages at
-    // most one partial per column and the two columns it can touch have different parity
+    // they are running, which is what makes a deadlock on the arrival counter impossible.
+    // `run_bound <= tiles_k` is what makes two staging slots per CTA enough: a run no longer than
+    // one column straddles at most one column boundary, so a CTA stages at most one partial per
+    // column and the two columns it can touch have different parity.
+    //
     // Which INSTANTIATIONS carry the staging path. Compile-time, so an ineligible shape emits
     // none of it and pays none of its register cost: two slots per CTA at a compile-time grid
     // bound must fit the arena budget. That is the only gate -- a VRAM bound, not a shape list.
@@ -127,7 +129,10 @@ void exl3_gemm_kernel_inner
     constexpr bool fixup_shape_ok = fixup_capable &&
         2ull * EXL3_GEMM_FIXUP_MAX_SLICES * TILESIZE_M * TILESIZE_N * 4
             <= (unsigned long long) EXL3_GEMM_FIXUP_BYTES;
-    float* fixup_arena = (float*) (locks + EXL3_GEMM_FIXUP_OFFSET);
+    // Computed under the same guard as everything else it feeds: left outside, its address
+    // arithmetic alone cost an ineligible instantiation 2 registers, and "the gate leaves the
+    // rest of the tree untouched" then had a counter-example in its own receipt
+    float* fixup_arena = fixup_shape_ok ? (float*) (locks + EXL3_GEMM_FIXUP_OFFSET) : nullptr;
     bool use_fixup = false;
     if constexpr (fixup_shape_ok)
     {
@@ -732,7 +737,6 @@ void exl3_gemm_kernel_inner
         if constexpr (fixup_shape_ok)
         if (use_fixup && !(first && last))
         {
-            int b_hi = block_of_unit((slice2_n + 1) * tiles_k - 1);
             if (!last)
             {
                 if (!sub_k) write_stage((int) blockIdx.x);
@@ -750,7 +754,8 @@ void exl3_gemm_kernel_inner
                 // Everyone above k-tile 0 has contributed exactly tiles_k - lock_d k-tiles
                 barrier_acquire(lock, tiles_k - lock_d);
                 if (!sub_k)
-                    for (int b = b_hi; b > (int) blockIdx.x; --b)
+                    for (int b = block_of_unit((slice2_n + 1) * tiles_k - 1);
+                         b > (int) blockIdx.x; --b)
                         add_stage(b);
                 fixed_up = true;
             }
