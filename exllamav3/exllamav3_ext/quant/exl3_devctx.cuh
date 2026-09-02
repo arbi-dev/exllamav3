@@ -32,7 +32,13 @@
 // back to the ordered chain; the kernel evaluates that predicate itself from gridDim and its own
 // tile constants, so host and device cannot disagree about which reduction ran.
 #define EXL3_GEMM_FIXUP_ENABLE_OFFSET (MGEMM_SLOTS_OFFSET + MGEMM_SLOTS_INTS)
-#define EXL3_GEMM_FIXUP_BYTES (16*1024*1024)
+#define EXL3_GEMM_FIXUP_BYTES (32*1024*1024)
+// Largest TILESIZE_M in EXL3_GEMM_TILESIZE_M. The eligibility bound is evaluated at THIS, never
+// at the instantiation's own TILESIZE_M, because TILESIZE_M is the one axis the shape pin lets
+// follow the row count: a bound that read it would turn the fixup on at a shallow tile and off
+// at a deep one WITHIN one pinned family, which is a row-count-keyed reduction -- exactly the
+// dependence the pin exists to remove. Keyed on (TILESIZE_K, TILESIZE_N), the family, it cannot.
+#define EXL3_GEMM_FIXUP_MAX_TILESIZE_M 96
 // Compile-time bound on gridDim.x, so a shape whose staging cannot fit the arena at ANY grid
 // width compiles the staging path away entirely instead of carrying its register pressure into
 // a kernel that will never take it. Checked again at runtime against the real grid

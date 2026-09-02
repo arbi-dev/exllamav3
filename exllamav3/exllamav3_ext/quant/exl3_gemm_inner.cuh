@@ -117,7 +117,14 @@ void exl3_gemm_kernel_inner
     //
     // Which INSTANTIATIONS carry the staging path. Compile-time, so an ineligible shape emits
     // none of it and pays none of its register cost: two slots per CTA at a compile-time grid
-    // bound must fit the arena budget. That is the only gate -- a VRAM bound, not a shape list.
+    // bound must fit the arena budget.
+    //
+    // The bound is evaluated at the table's LARGEST TILESIZE_M, not at this instantiation's own.
+    // Read at its own, it made the fixup fire at 16x512 and decline at 32x512 -- two tiles of ONE
+    // pinned family, selected by row count -- so row 0 of a 48-row call stopped matching row 0 of
+    // a 1-row call on 5120x17408. Caught by the row-invariance arm of the gate, which is the
+    // property the whole shape-pin subsystem exists to hold. Keyed on (TILESIZE_K, TILESIZE_N),
+    // which is what the pin actually freezes, no row count can move it.
     //
     // What it costs where it IS compiled, measured with ptxas rather than assumed
     // (docs/receipts/exl3-streamk-fixup-ptxas.txt): the reducer holds every accumulator live
@@ -127,7 +134,7 @@ void exl3_gemm_kernel_inner
     // given more registers and take it as spill instead, +32 to +44 bytes, in an epilogue that
     // runs once per column rather than in the mainloop.
     constexpr bool fixup_shape_ok = fixup_capable &&
-        2ull * EXL3_GEMM_FIXUP_MAX_SLICES * TILESIZE_M * TILESIZE_N * 4
+        2ull * EXL3_GEMM_FIXUP_MAX_SLICES * EXL3_GEMM_FIXUP_MAX_TILESIZE_M * TILESIZE_N * 4
             <= (unsigned long long) EXL3_GEMM_FIXUP_BYTES;
     // Computed under the same guard as everything else it feeds: left outside, its address
     // arithmetic alone cost an ineligible instantiation 2 registers, and "the gate leaves the
