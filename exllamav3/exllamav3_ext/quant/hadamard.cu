@@ -5,6 +5,7 @@
 #include "../util.h"
 #include "../util.cuh"
 #include "hadamard_inner.cuh"
+#include "had_scale.h"
 
 template <bool pre_scale, bool post_scale>
 __global__ __launch_bounds__(32)
@@ -104,7 +105,7 @@ void had_r_128
     int cols = input.size(1);
 
     int blocks = cols / 128;
-    float r_scale = scale * 0.088388347648f; // scale / sqrt(128)
+    float r_scale = scale * exl3_had::HAD_R_SCALE;
 
     dim3 blockDim(32);
     dim3 gridDim(rows, blocks);
@@ -203,7 +204,7 @@ void had_r_128_dual
     )
 
     int blocks = cols / 128;
-    float r_scale = scale * 0.088388347648f; // scale / sqrt(128)
+    float r_scale = scale * exl3_had::HAD_R_SCALE;
 
     dim3 blockDim(32);
     dim3 gridDim(rows, blocks);

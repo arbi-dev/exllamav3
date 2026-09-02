@@ -1,4 +1,6 @@
 #include "moe_mul1.h"
+
+#include "../quant/had_scale.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
 
@@ -58,7 +60,7 @@ void exl3_moe_cpu_set_prof(bool enabled)
 namespace {
 
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
-constexpr float HAD_SCALE = 0.088388347648f;
+constexpr float HAD_SCALE = exl3_had::HAD_R_SCALE;
 constexpr int MAX_M = 4;
 
 #if defined(__GNUC__) && defined(__linux__)

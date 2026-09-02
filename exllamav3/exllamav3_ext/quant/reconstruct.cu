@@ -7,6 +7,7 @@
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
+#include "had_scale.h"
 
 template <int K, int cb>
 __global__ __launch_bounds__(256)
@@ -173,7 +174,7 @@ void reconstruct_had_kernel
 )
 {
     constexpr int packed_size = 256 * K / 16;
-    constexpr float r_scale = 0.08838834764831845f;
+    constexpr float r_scale = exl3_had::HAD_R_SCALE;
 
     int t = threadIdx.x;
     int lane_id = t % 32;

@@ -7,6 +7,7 @@
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
 
 #include "exl3_dq.cuh"
+#include "had_scale.h"
 
 // On GA10x, HMMA with fp32 accumulation runs at half rate and dominates the m=1 (decode-bound) case.
 // Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
@@ -496,12 +497,12 @@ void exl3_gemm_kernel_inner
             if constexpr (c_fp32)
             {
                 float* had_out = gl_c_ptr_32 + (m * 16 + row) * size_n + col * 128;
-                had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
+                had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, exl3_had::HAD_R_SCALE);
             }
             else
             {
                 half* had_out = gl_c_ptr_16 + (m * 16 + row) * size_n + col * 128;
-                had_fh_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
+                had_fh_r_128_inner<false, true>(had_in, had_out, post_scale_c, exl3_had::HAD_R_SCALE);
             }
         }
     };

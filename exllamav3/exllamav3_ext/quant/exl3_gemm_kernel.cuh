@@ -4,6 +4,7 @@
 #include "hadamard_inner.cuh"
 #include "exl3_gemm_inner.cuh"
 #include "exl3_devctx.cuh"
+#include "had_scale.h"
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -23,7 +24,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                 A + this_warp * 128,
                 A_had + this_warp * 128,
                 suh + (this_warp * 128) % size_k,
-                0.088388347648f  // 1/sqrt(128)
+                exl3_had::HAD_R_SCALE
             );
 
         grid.sync();
@@ -64,7 +65,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                     ((const float*) C) + this_warp * 128,
                     ((float*) C) + this_warp * 128,
                     svh + (this_warp * 128) % size_n,
-                    0.088388347648f  // 1/sqrt(128)
+                    exl3_had::HAD_R_SCALE
                 );
             else
                 had_hf_r_128_inner<false, true>
@@ -72,7 +73,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                     ((const half*) C) + this_warp * 128,
                     ((half*) C) + this_warp * 128,
                     svh + (this_warp * 128) % size_n,
-                    0.088388347648f  // 1/sqrt(128)
+                    exl3_had::HAD_R_SCALE
                 );
         }
     }
@@ -187,7 +188,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     A_ + this_warp * 128,
                     A_had_ + this_warp * 128,
                     suh + (this_warp * 128) % size_k,
-                    0.088388347648f  // 1/sqrt(128)
+                    exl3_had::HAD_R_SCALE
                 );
         }
 
@@ -242,7 +243,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
             const half* svh = svh_list[mat_index];
-            float scale = 0.088388347648f;  // 1/sqrt(128)
+            float scale = exl3_had::HAD_R_SCALE;
             if (B_weights) scale *= __half2float(B_weights[j]);
 
             C_ = C_base;
