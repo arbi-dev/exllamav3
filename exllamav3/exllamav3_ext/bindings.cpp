@@ -128,6 +128,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("svh"), py::arg("force_shape_idx"), py::arg("mcg"), py::arg("mul1"),
           py::arg("force_num_sms"), py::arg("size_n_out") = 0);
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
+    m.def("exl3_set_parallel_fixup", &exl3_set_parallel_fixup, "exl3_set_parallel_fixup");
+    m.def("exl3_parallel_fixup_available", &exl3_parallel_fixup_available, "exl3_parallel_fixup_available");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("g_get_cc", &g_get_cc, "g_get_cc");

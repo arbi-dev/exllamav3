@@ -32,7 +32,11 @@
 // back to the ordered chain; the kernel evaluates that predicate itself from gridDim and its own
 // tile constants, so host and device cannot disagree about which reduction ran.
 #define EXL3_GEMM_FIXUP_ENABLE_OFFSET (MGEMM_SLOTS_OFFSET + MGEMM_SLOTS_INTS)
-#define EXL3_GEMM_FIXUP_BYTES (4*1024*1024)
+#define EXL3_GEMM_FIXUP_BYTES (16*1024*1024)
+// Compile-time bound on gridDim.x, so a shape whose staging cannot fit the arena at ANY grid
+// width compiles the staging path away entirely instead of carrying its register pressure into
+// a kernel that will never take it. Checked again at runtime against the real grid
+#define EXL3_GEMM_FIXUP_MAX_SLICES 256
 #define EXL3_GEMM_FIXUP_FLOATS (EXL3_GEMM_FIXUP_BYTES / 4)
 // Rounded to a 16-byte boundary: the staging stores two adjacent floats per fragment element and
 // the compiler is free to merge them into one 8-byte store, which faults on a 4-byte-aligned base
@@ -57,6 +61,7 @@ private:
     int cc[MAX_DEVICES] = {};
     void* locks[MAX_DEVICES] = {};
     void* ws[MAX_DEVICES] = {};
+    bool fixup_arena_live[MAX_DEVICES] = {};
     std::mutex mtx;
 
 public:
@@ -66,6 +71,7 @@ public:
     void* get_ws(int device);
     int* get_locks(int device);
     void set_gemm_parallel_fixup(int device, int enable);
+    bool gemm_fixup_arena(int device);
 
 private:
     DevCtx() = default;
@@ -75,5 +81,9 @@ private:
 
 int g_get_cc(int device);
 int g_get_num_sms(int device);
+
+// EXL3_GEMM_PARALLEL_FIXUP, read once per process. It decides whether the arena is ALLOCATED,
+// so a build that leaves the flag off pays no VRAM for it at all
+bool exl3_gemm_parallel_fixup_env();
 
 void prepare_ctx(int device);

@@ -78,3 +78,8 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& size_n_list = {},
     const c10::optional<at::Tensor>& c_ptrs = {}
 );
+
+// Bench-only: flip the already-allocated stream-K fixup arena's enable word (see
+// DevCtx::set_gemm_parallel_fixup). Refuses to enable an arena that was never allocated
+void exl3_set_parallel_fixup(int64_t device, bool enable);
+bool exl3_parallel_fixup_available(int64_t device);
