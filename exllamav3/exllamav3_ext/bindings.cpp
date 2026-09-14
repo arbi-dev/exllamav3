@@ -149,7 +149,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
-    m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+    m.def("exl3_gemm", &exl3_gemm, "exl3_gemm",
+          py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"),
+          py::arg("svh"), py::arg("force_shape_idx"), py::arg("mcg"), py::arg("mul1"),
+          py::arg("force_num_sms"), py::arg("size_n_out") = 0);
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
@@ -178,7 +181,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("mul1"), py::arg("min_index"), py::arg("max_index"), py::arg("force_num_sms"),
           py::arg("num_tokens") = 1, py::arg("size_n_list") = py::none(), py::arg("c_ptrs") = py::none(),
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
-    m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm", &hgemm, "hgemm",
+          py::arg("a"), py::arg("b"), py::arg("c"), py::arg("acc_mode") = 0);
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
     m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");

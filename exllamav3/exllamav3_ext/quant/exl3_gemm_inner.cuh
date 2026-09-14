@@ -36,7 +36,8 @@ void exl3_gemm_kernel_inner
     const int size_n,
     int* __restrict__ locks,
     const half* post_scale,
-    int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
+    int size_n_stride = 0,    // full width of B and C when computing a column slice (0: = size_n)
+    const int size_n_b = 0    // B's k-row pitch when it stores MORE columns than C emits (0: = size_n_stride)
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -44,6 +45,9 @@ void exl3_gemm_kernel_inner
     // Column blocks of the full-width B row: slices index B relative to their own column offset,
     // but a k-tile row still spans the whole matrix
     const int blocks_n_full = size_n_stride / 16;
+    // B's k-row pitch is the STORED weight width, which is size_n_stride only when C is as
+    // wide as B. A caller emitting a LEADING window of a wider weight passes the stored width
+    const int blocks_n_b = (size_n_b ? size_n_b : size_n_stride) / 16;
     const int TILEBLOCKS_K = TILESIZE_K / 16;
     const int TILEBLOCKS_N = TILESIZE_N / 16;
     // const int FRAGS_M = TILEBLOCKS_M;
@@ -66,6 +70,10 @@ void exl3_gemm_kernel_inner
     // Sanity checks
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
     static_assert(TILESIZE_M >= 16 && TILESIZE_M % 16 == 0, "Invalid kernel params");
+    // The A-fragment XOR swizzle indexes row m as m * A_COLS + (k ^ x). It only stays inside
+    // the row when A_COLS is a power of two; otherwise the swizzled column runs past the row
+    // and both the store and the ldsm4 read alias neighbouring rows
+    static_assert((A_COLS & (A_COLS - 1)) == 0, "Invalid kernel params (TILESIZE_K / 8 must be a power of two)");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert
@@ -134,7 +142,7 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = m < size_m;
     }
 
-    int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n_b * TILEBLOCKS_K * 256 / 16 * bits;
     const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
     const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
@@ -147,7 +155,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n_full * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n_b * 256 / 16 * bits / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 

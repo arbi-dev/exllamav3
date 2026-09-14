@@ -29,26 +29,19 @@ EXL3 matmul, A @ B -> C
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
 - svh: optional, packed output scales/flips, shape (n//16), dtype float16
+- size_n_out: optional output width. 0 emits every column B stores. A positive value emits the
+  LEADING size_n_out columns of B and reads only the trellis blocks and svh entries they need,
+  so a caller wanting a narrow projection can pass the wide weight itself instead of a
+  materialized slice. B's k-row pitch stays the stored width either way
 
 limitations:
 - k % 16 == 0
 - n % 128 == 0
+- B contiguous. Its k-row pitch is taken from B.size(1), not from a stride, so a strided B
+  would read the wrong blocks with no shape check able to see it
 */
 
 std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
-
-uint64_t roundup_pow2(uint64_t x)
-{
-    if (x == 0) return 1;
-    x--;
-    x |= x >> 1;
-	x |= x >> 2;
-	x |= x >> 4;
-	x |= x >> 8;
-	x |= x >> 16;
-	x |= x >> 32;
-    return x + 1;
-}
 
 uint64_t gemm_autotune_hash
 (
@@ -69,7 +62,11 @@ uint64_t gemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) MIN(roundup_pow2(size_m), 16));
+    // Bucket by 16-row MMA blocks. Every TILESIZE_M is a multiple of 16, so two batch sizes
+    // with the same block count run the same number of strips in every candidate shape and
+    // rank the same. Rounding to a power of two instead merges batch sizes whose best shape
+    // differs, e.g. 33 and 64 across a shape set holding both TILESIZE_M 48 and 64
+    mix((uint64_t) MIN(CEIL_DIVIDE(size_m, 16), 24));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
     mix((uint64_t) K);
@@ -119,7 +116,8 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    int size_n_out
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -127,7 +125,24 @@ int exl3_gemm_gr
 
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
-    TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+    // The kernel derives B's k-row pitch from B.size(1) and indexes from B.data_ptr(); it takes
+    // no stride for B, so a strided view passes every shape check and then reads the wrong
+    // trellis blocks. Refuse it here rather than emit silently wrong output
+    TORCH_CHECK(B.is_contiguous(), "exl3_gemm: B must be contiguous");
+    int size_n_stored = B.size(1) * 16;
+    if (size_n_out)
+    {
+        TORCH_CHECK(size_n_out > 0 && size_n_out % 128 == 0,
+            "exl3_gemm: size_n_out must be a positive multiple of 128");
+        TORCH_CHECK(size_n_out <= size_n_stored,
+            "exl3_gemm: size_n_out exceeds the width B stores");
+        TORCH_CHECK(C.size(-1) == size_n_out,
+            "exl3_gemm: C width must equal size_n_out");
+    }
+    else
+    {
+        TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+    }
     // TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kShort);
@@ -167,7 +182,8 @@ int exl3_gemm_gr
     int dim = A.dim();
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
-    int size_n = B.size(1) * 16;
+    int size_n = size_n_out ? size_n_out : size_n_stored;
+    int size_n_b = size_n_stored;
 
     // Select kernel
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
@@ -179,7 +195,7 @@ int exl3_gemm_gr
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
     // to the regular kernel.
-    if (mul1 && exl3_gemv_int8_enabled())
+    if (mul1 && !size_n_out && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
@@ -200,7 +216,8 @@ int exl3_gemm_gr
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr
+        (void*)& svh_ptr,
+        (void*)& size_n_b
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -319,7 +336,8 @@ int exl3_gemm
     int force_shape_idx,
     bool mcg,
     bool mul1,
-    int force_num_sms
+    int force_num_sms,
+    int size_n_out
 )
 {
     return exl3_gemm_gr
@@ -334,7 +352,8 @@ int exl3_gemm
         mcg,
         mul1,
         force_num_sms,
-        nullptr
+        nullptr,
+        size_n_out
     );
 }
 
@@ -365,11 +384,12 @@ or q = j otherwise. This supports the following modes:
   the kernel reads its first num_indices entries as q values. Negative indices
   skip that slot.
 - Weighted MoE reduction: weights is a float16 tensor parallel to indices.
-  Each transformed result is multiplied by weights[j], then all active C[j]
-  are summed into C[0]. C therefore also serves as per-expert scratch; only
-  C[0] is the reduced result.
+  Each transformed result is multiplied by weights[j], then the active C[j]
+  are summed per token: slots are split into num_tokens contiguous groups of
+  bszm / num_tokens and group t is summed into C[t]. C therefore also serves
+  as per-expert scratch; only C[0..num_tokens) are reduced results.
 - Expert-range filtering: with min_index >= 0, selections outside
-  [min_index, max_index) are removed and retained indices are rebased by
+  [min_index, max_index) are skipped and retained indices are rebased by
   min_index. This allows B/suh/svh to be local pointer tables for an expert
   shard. At num_tokens == 1 the retained indices (and their weights) are
   compacted; at num_tokens > 1 out-of-range slots are instead masked to -1 in
@@ -379,8 +399,7 @@ or q = j otherwise. This supports the following modes:
 Without weights, every active C[j] is a separate output. The active slot count
 is max(a_batches, c_batches), capped to num_indices when indices is present.
 
-Limitations: k must be divisible by 16 and n by 128. Range filtering supports
-at most 128 slots (the kernel's index-compaction capacity).
+Limitations: k must be divisible by 16 and n by 128.
 */
 
 int exl3_mgemm_gr
