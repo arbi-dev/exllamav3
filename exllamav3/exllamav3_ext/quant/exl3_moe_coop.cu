@@ -103,8 +103,10 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
     MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
+    // act_auto: kernel B stages its run's rescaled activation rows in shared memory
+    const int smem_b = kb.smem + (p.act_auto ? exl3_moe_coop_ns::ROWS * p.I * 2 : 0);
     moe_coop_smem_optin(ka.kernel, ka.smem);
-    moe_coop_smem_optin(kb.kernel, kb.smem);
+    moe_coop_smem_optin(kb.kernel, smem_b);
 
     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
     const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
@@ -122,7 +124,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
         exl3_moe_coop_ns::exl3_moe_coop_rot_kernel<<<rot_grid, MOE_COOP_THREADS, 0, stream>>>(p);
     }
     cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
-    cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
+    cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, smem_b, stream));
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -251,6 +253,48 @@ void exl3_moe_coop_run
     const c10::optional<at::Tensor>& sh_out
 )
 {
+    exl3_moe_coop_run_scaled(p, K_gu, K_d, cb, x, sel, rw, sh_out, c10::nullopt, c10::nullopt, c10::nullopt, c10::nullopt);
+}
+
+void exl3_moe_coop_run_scaled
+(
+    MoeCoopParams p, int K_gu, int K_d, int cb,
+    const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
+    const c10::optional<at::Tensor>& sh_out,
+    const c10::optional<at::Tensor>& in_scale,
+    const c10::optional<at::Tensor>& act_scale,
+    const c10::optional<at::Tensor>& slot_scale,
+    const c10::optional<at::Tensor>& ovf
+)
+{
+    auto scalar_ptr = [&] (const c10::optional<at::Tensor>& t, const char* what) -> const float*
+    {
+        if (!t) return nullptr;
+        TORCH_CHECK(t->scalar_type() == at::kFloat && t->numel() == 1 && t->device() == x.device(),
+                    "exl3_moe_coop: ", what, " must be a one-element fp32 tensor on the input's device");
+        return (const float*) t->data_ptr();
+    };
+    p.in_scale = scalar_ptr(in_scale, "in_scale");
+    p.act_scale = scalar_ptr(act_scale, "act_scale");
+    p.act_auto = slot_scale.has_value();
+    p.slot_scale = nullptr;
+    if (p.act_auto)
+    {
+        TORCH_CHECK(!act_scale, "exl3_moe_coop: act_scale and act_auto (slot_scale) are exclusive");
+        TORCH_CHECK(p.gu_f32, "exl3_moe_coop: act_auto stores the activation in fp32 gate/up scratch (gu_f32)");
+        TORCH_CHECK(slot_scale->scalar_type() == at::kFloat && slot_scale->is_contiguous() &&
+                    slot_scale->numel() >= p.slots_max && slot_scale->device() == x.device(),
+                    "exl3_moe_coop: slot_scale must be contiguous fp32 with one entry per scratch slot");
+        p.slot_scale = (float*) slot_scale->data_ptr();
+    }
+    p.ovf = nullptr;
+    if (ovf)
+    {
+        TORCH_CHECK(ovf->scalar_type() == at::kInt && ovf->numel() >= 1 && ovf->device() == x.device(),
+                    "exl3_moe_coop: ovf must be an int32 device counter");
+        p.ovf = (int*) ovf->data_ptr();
+    }
+
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const int device = x.device().index();
@@ -277,6 +321,61 @@ void exl3_moe_coop_run
     else
         p.sh_gate_w = nullptr;
     exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream);
+}
+
+static void exl3_moe_coop_impl
+(
+    const at::Tensor& x,
+    const at::Tensor& sel,
+    const at::Tensor& rw,
+    int min_expert,
+    int max_expert,
+    int Hi,
+    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
+    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
+    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
+    const c10::optional<at::Tensor>& g_bias,
+    const c10::optional<at::Tensor>& u_bias,
+    const c10::optional<at::Tensor>& d_bias,
+    int Kg, int Ku, int Kd,
+    bool mcg, bool mul1,
+    int act,
+    float act_limit,
+    bool gated,
+    at::Tensor& had_g,
+    at::Tensor& had_u,
+    at::Tensor& gu_g,
+    at::Tensor& gu_u,
+    at::Tensor& act_out,
+    at::Tensor& d_out,
+    at::Tensor& ctr,
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& sh_out,
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& in_scale,
+    const c10::optional<at::Tensor>& act_scale,
+    const c10::optional<at::Tensor>& slot_scale,
+    const c10::optional<at::Tensor>& ovf
+)
+{
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(sel, kLong);
+    TORCH_CHECK_DTYPE(rw, kHalf);
+    TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous(), "exl3_moe_coop: sel/rw must be contiguous");
+    TORCH_CHECK(sel.sizes() == rw.sizes() && sel.dim() == 2 && sel.size(0) == x.size(0), "exl3_moe_coop: sel/rw must be (bsz, topk)");
+    if (sh_out)
+    {
+        TORCH_CHECK_DTYPE(sh_out.value(), kFloat);
+        TORCH_CHECK(sh_out->is_contiguous() && sh_out->size(-1) == x.size(1) && sh_out->numel() >= x.size(0) * x.size(1),
+                    "exl3_moe_coop: shared expert output shape");
+    }
+    int K_gu, K_d, cb;
+    MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
+                                            g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated,
+                                            had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);
+    p.min_expert = min_expert;
+    p.max_expert = max_expert;
+    exl3_moe_coop_run_scaled(p, K_gu, K_d, cb, x, sel, rw, sh_out, in_scale, act_scale, slot_scale, ovf);
 }
 
 void exl3_moe_coop
@@ -310,22 +409,43 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>& sh_gate_w
 )
 {
-    TORCH_CHECK_DTYPE(x, kHalf);
-    TORCH_CHECK_DTYPE(sel, kLong);
-    TORCH_CHECK_DTYPE(rw, kHalf);
-    TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous(), "exl3_moe_coop: sel/rw must be contiguous");
-    TORCH_CHECK(sel.sizes() == rw.sizes() && sel.dim() == 2 && sel.size(0) == x.size(0), "exl3_moe_coop: sel/rw must be (bsz, topk)");
-    if (sh_out)
-    {
-        TORCH_CHECK_DTYPE(sh_out.value(), kFloat);
-        TORCH_CHECK(sh_out->is_contiguous() && sh_out->size(-1) == x.size(1) && sh_out->numel() >= x.size(0) * x.size(1),
-                    "exl3_moe_coop: shared expert output shape");
-    }
-    int K_gu, K_d, cb;
-    MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
-                                            g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated,
-                                            had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);
-    p.min_expert = min_expert;
-    p.max_expert = max_expert;
-    exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, sh_out);
+    exl3_moe_coop_impl(x, sel, rw, min_expert, max_expert, Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh, g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_out, sh_gate_w, c10::nullopt, c10::nullopt, c10::nullopt, c10::nullopt);
+}
+
+void exl3_moe_coop_scaled
+(
+    const at::Tensor& x,
+    const at::Tensor& sel,
+    const at::Tensor& rw,
+    int min_expert,
+    int max_expert,
+    int Hi,
+    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
+    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
+    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
+    const c10::optional<at::Tensor>& g_bias,
+    const c10::optional<at::Tensor>& u_bias,
+    const c10::optional<at::Tensor>& d_bias,
+    int Kg, int Ku, int Kd,
+    bool mcg, bool mul1,
+    int act,
+    float act_limit,
+    bool gated,
+    at::Tensor& had_g,
+    at::Tensor& had_u,
+    at::Tensor& gu_g,
+    at::Tensor& gu_u,
+    at::Tensor& act_out,
+    at::Tensor& d_out,
+    at::Tensor& ctr,
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& sh_out,
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& in_scale,
+    const c10::optional<at::Tensor>& act_scale,
+    const c10::optional<at::Tensor>& slot_scale,
+    const c10::optional<at::Tensor>& ovf
+)
+{
+    exl3_moe_coop_impl(x, sel, rw, min_expert, max_expert, Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh, g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_out, sh_gate_w, in_scale, act_scale, slot_scale, ovf);
 }

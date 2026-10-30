@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -63,11 +64,15 @@ int* DevCtx::get_locks(int device)
     if (!locks[device])
     {
         c10::cuda::CUDAGuard guard(device);
-        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + MGEMM_SLOTS_INTS) * sizeof(int);
+        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + MGEMM_SLOTS_INTS + MGEMM_FLAGS_INTS) * sizeof(int);
         cudaError_t e = cudaMalloc(&locks[device], size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer memset failed: ", cudaGetErrorString(e));
+        const char* gb = std::getenv("EXL3_MGEMM_GROUP_BARRIER");
+        int flags[MGEMM_FLAGS_INTS] = { (gb && atoi(gb) > 0) ? 1 : 0 };
+        e = cudaMemcpy(((int*) locks[device]) + MGEMM_FLAGS_OFFSET, flags, sizeof(flags), cudaMemcpyHostToDevice);
+        TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer flags write failed: ", cudaGetErrorString(e));
     }
     return (int*) locks[device];
 }

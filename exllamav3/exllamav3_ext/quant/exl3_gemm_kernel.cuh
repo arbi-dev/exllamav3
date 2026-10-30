@@ -93,8 +93,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     int bszm = MAX(bszm_in, bszm_out);
     auto grid = cg::this_grid();
 
+    int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
     #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
-        int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
+        constexpr bool group_sync = true;
+    #else
+        const bool group_sync = locks[MGEMM_FLAGS_OFFSET] != 0;   // grid-uniform
     #endif
 
     // Local matrix for slot j, or -1 if the slot is inactive. With min_index >= 0 the tables are
@@ -221,11 +224,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 );
         }
 
-        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
-            group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
-        #else
-            grid.sync();
-        #endif
+        if (group_sync) group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+        else grid.sync();
 
         // Matmul. Per-matrix output width/pointer when the caller supplies the lists
         // (size_n then only sizes the per-z-slice lock ranges and must be the max width);
@@ -258,11 +258,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             else                  C_ = (void*) (((half*) C_) + TILESIZE_M * n_stride_j);
             size_m_ -= TILESIZE_M;
 
-            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
-                group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
-            #else
-                grid.sync();
-            #endif
+            if (group_sync) group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+            else grid.sync();
         }
 
         // Had and output scales
