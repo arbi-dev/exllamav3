@@ -93,7 +93,17 @@ struct MoeCoopParams
     bool act_auto;
     float* slot_scale;          // (slots_max,) fp32 scratch, act_auto only
     int* ovf;
+
+    // GEMV accumulation (launcher: EXL3_MOE_COOP_ACC / EXL3_MOE_COOP_FOLD, else the defaults below)
+    int acc_mode;               // MOE_COOP_ACC32_A | MOE_COOP_ACC32_B: fp32-accumulate MMA per stage
+    int fold;                   // fp16-accumulate stages: k-slices (16 products) per fp32 fold
 };
+
+#define MOE_COOP_ACC32_A 1
+#define MOE_COOP_ACC32_B 2
+#ifndef MOE_COOP_ACC_DEFAULT
+#define MOE_COOP_ACC_DEFAULT 0      // set after measurement
+#endif
 
 // act_auto: the stored activation peak bound. Leaves the down stage's fp16 accumulation
 // (64 products before each fp32 fold) headroom for the trellis weights' magnitude

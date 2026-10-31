@@ -95,6 +95,12 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
 {
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
+    {
+        static int acc = std::getenv("EXL3_MOE_COOP_ACC") ? atoi(std::getenv("EXL3_MOE_COOP_ACC")) : MOE_COOP_ACC_DEFAULT;
+        static int fold = std::getenv("EXL3_MOE_COOP_FOLD") ? atoi(std::getenv("EXL3_MOE_COOP_FOLD")) : 4;
+        p.acc_mode = acc;
+        p.fold = fold < 1 ? 1 : fold;
+    }
     const int slots = p.bsz * p.topk;
     const int nproj = p.gated ? 2 : 1;
     p.a_global = p.bsz > 1;

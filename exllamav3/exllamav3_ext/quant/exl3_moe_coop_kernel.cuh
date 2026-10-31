@@ -34,7 +34,7 @@ namespace exl3_moe_coop_ns {
 constexpr int WK = 16;                          // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
 constexpr int PF = 4;                           // prefetch ring depth
-constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
+constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence (fp16-accumulate tiles)
 constexpr int THREADS = WK * 32;
 constexpr int COLS = WNT * 16;                  // columns per warp
 constexpr int ROWS = 8;                         // slots of one expert per block (MMA rows)
@@ -336,7 +336,28 @@ __device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, in
 // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
 // dq_dispatch
 
-template <int bits, int cb, bool WIDE>
+// mma.m16n8k16 with the A operand as two FragB halves, fp32 accumulate (rows 8..15 of A are zero,
+// so c[2], c[3] stay zero)
+__device__ __forceinline__ void mma_ab_f(const FragB& a01, const FragB& a23, const FragB& b, FragC& c)
+{
+    const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
+    const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
+    const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
+    float* cc = reinterpret_cast<float*>(&c);
+    asm
+    (
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
+        :  "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
+           "r"(bb[0]), "r"(bb[1])
+    );
+}
+
+// ACC32: accumulate the products in fp32 inside the MMA. The fp16-accumulate form rounds every
+// partial sum to fp16 for `fold` k-slices (16 products each) before adding it to fp32, which on
+// rows with a few huge activations (late-layer outliers) costs more than the weights' own error
+template <int bits, int cb, bool WIDE, bool ACC32>
 __device__ __forceinline__ void gemv_tile
 (
     const uint32_t* __restrict__ B32,
@@ -353,7 +374,8 @@ __device__ __forceinline__ void gemv_tile
     int ntiles,
     int group,                          // block column group of tile_cols<WIDE>() columns
     float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
-    uint32_t* __restrict__ sh_stage     // [WK][STAGE_WORDS], staged widths only
+    uint32_t* __restrict__ sh_stage,    // [WK][STAGE_WORDS], staged widths only
+    int fold                            // fp16-accumulate fold cadence in k-slices (!ACC32)
 )
 {
     constexpr bool REG = tile_reg<bits>();
@@ -423,6 +445,7 @@ __device__ __forceinline__ void gemv_tile
                 pf[d][l] = ld_b(d, l);
 
     FragC_h ch[WNT][2] = {};
+    [[maybe_unused]] FragC cf[WNT][2] = {};
     float2 acc0[WNT][2] = {};
 
     for (int ib = 0; ib < myn; ib += PF)
@@ -491,11 +514,19 @@ __device__ __forceinline__ void gemv_tile
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                if constexpr (ACC32)
+                {
+                    mma_ab_f(a01, a23, f0, cf[t][0]);
+                    mma_ab_f(a01, a23, f1, cf[t][1]);
+                }
+                else
+                {
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                }
             }
 
-            if ((d + 1) % FOLD == 0 || i + 1 == myn)
+            if (!ACC32 && ((d + 1) % fold == 0 || i + 1 == myn))
             {
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
@@ -508,6 +539,18 @@ __device__ __forceinline__ void gemv_tile
                     }
             }
         }
+    }
+
+    if constexpr (ACC32)
+    {
+        #pragma unroll
+        for (int t = 0; t < WNT; ++t)
+            #pragma unroll
+            for (int f = 0; f < 2; ++f)
+            {
+                acc0[t][f].x = cf[t][f][0];
+                acc0[t][f].y = cf[t][f][1];
+            }
     }
 
     // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
@@ -768,7 +811,10 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE>(B32, A2, a_stride2, sh_rows, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        if (p.acc_mode & MOE_COOP_ACC32_A)
+            gemv_tile<bits, cb, WIDE, true>(B32, A2, a_stride2, sh_rows, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage, p.fold);
+        else
+            gemv_tile<bits, cb, WIDE, false>(B32, A2, a_stride2, sh_rows, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage, p.fold);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -944,8 +990,12 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     {
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
-        gemv_tile<bits, cb, WIDE>(B32, A2, (size_t) p.I / 2, sh_rows, a_rows, nrows, C, p.Ho, true,
-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+        if (p.acc_mode & MOE_COOP_ACC32_B)
+            gemv_tile<bits, cb, WIDE, true>(B32, A2, (size_t) p.I / 2, sh_rows, a_rows, nrows, C, p.Ho, true,
+                                            k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, p.fold);
+        else
+            gemv_tile<bits, cb, WIDE, false>(B32, A2, (size_t) p.I / 2, sh_rows, a_rows, nrows, C, p.Ho, true,
+                                             k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, p.fold);
     }
 
     for (int r = 0; r < nrows; ++r)
