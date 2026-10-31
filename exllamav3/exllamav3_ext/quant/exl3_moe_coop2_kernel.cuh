@@ -157,6 +157,24 @@ __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int 
     return m > MOE_COOP2_ACT_AUTO_PEAK ? exp2f(ceilf(log2f(m / MOE_COOP2_ACT_AUTO_PEAK))) : 1.0f;
 }
 
+// K segments per unit for a step of u1 (run, projection, group) tiles of `chunks` k chunks on a
+// grid of G blocks: the split that minimises waves * (chunks per unit + a unit's fixed cost of
+// half a chunk), ties to the smaller split. Bounded by the partial-sum capacity. Every block
+// computes the same value from the same run table: a pure function of the routing
+__host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int cap)
+{
+    const int hi = chunks < cap ? chunks : cap;
+    int best = 1, best_cost = 0x7fffffff;
+    for (int ks = 1; ks <= hi; ++ks)
+    {
+        const int per = (chunks + ks - 1) / ks;
+        const int waves = (u1 * ks + G - 1) / G;
+        const int cost = waves * (2 * per + 1);
+        if (cost < best_cost) { best_cost = cost; best = ks; }
+    }
+    return best;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Run table: active slots sorted stably by (local expert, slot), cut into runs of at most RMAX
 // slots of one expert. Every block builds the same table from the routing. Persistent arrays
@@ -361,6 +379,7 @@ __device__ __forceinline__ void unit_gemv
     const half* suh,            // A: the expert's input scale
     const float* inv,           // B: per-row inverse activation scale
     uint32_t* ring, half* abuf,
+    int pfd,                    // L2 prefetch distance in slices, 0 = none
     FragC (&acc)[WNT][2]
 )
 {
@@ -379,7 +398,6 @@ __device__ __forceinline__ void unit_gemv
     // L2 prefetch runs pfd slices ahead of the ring: the smem ring bounds what a warp can hold,
     // not what it can have requested, so the whole unit's weights are in flight from the start
     constexpr int LPS = CEIL_DIVIDE(SW * 4, 128);       // 128-byte lines per slice
-    const int pfd = (p.dbg & 4) ? 0 : p.pfd;
     const uint32_t* pbase = B32 + (size_t) tile0 * 8 * bits + (size_t) c0 * SPC * sstride;
     auto prefetch = [&] (int i0, int i1)
     {
@@ -527,12 +545,16 @@ void exl3_moe_coop2_a_kernel(const MoeCoop2Params p)
     const int nproj = p.gated ? 2 : 1;
     const int chunks = p.Hi / KC;
     const int ntiles = p.I / 16;
-    const int n_units = rt.n_runs * nproj * p.cg_a * p.ks_a;
+    const int ks_a = p.ks_a > 0 ? p.ks_a : pick_ks(rt.n_runs * nproj * p.cg_a, chunks, gridDim.x, p.cap_a / p.slots);
+    const int n_units = rt.n_runs * nproj * p.cg_a * ks_a;
+    // A single-wave step streams each unit's weights through L2 prefetches ahead of the ring
+    // (several units per block: the prefetches only add traffic)
+    const int pfd = (n_units <= (int) gridDim.x && !(p.dbg & 4)) ? p.pfd : 0;
 
     for (int u = blockIdx.x; u < n_units; u += gridDim.x)
     {
-        const int ks = u % p.ks_a;
-        int r = u / p.ks_a;
+        const int ks = u % ks_a;
+        int r = u / ks_a;
         const int group = r % p.cg_a;
         r /= p.cg_a;
         const int proj = r % nproj;
@@ -542,17 +564,17 @@ void exl3_moe_coop2_a_kernel(const MoeCoop2Params p)
         int nrows;
         load_run(rt, run, sh_rows, nrows);
 
-        const int c0 = chunks * ks / p.ks_a;
-        const int c1 = chunks * (ks + 1) / p.ks_a;
+        const int c0 = chunks * ks / ks_a;
+        const int c1 = chunks * (ks + 1) / ks_a;
         const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[e];
         const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[e];
 
         FragC acc[WNT][2];
-        unit_gemv<bits, cb, false>(p, B32, ntiles, group, c0, c1, sh_rows, nrows, suh, nullptr, ring, abuf, acc);
-        float* part = p.part_a + (size_t) (proj * p.ks_a + ks) * p.slots * p.I;
+        unit_gemv<bits, cb, false>(p, B32, ntiles, group, c0, c1, sh_rows, nrows, suh, nullptr, ring, abuf, pfd, acc);
+        float* part = p.part_a + (size_t) (proj * ks_a + ks) * p.slots * p.I;
         store_partials(part, p.I, ntiles, group, sh_rows, nrows, acc);
 
-        if (!arrive_last(p.ctr_a + run * p.cg_a + group, nproj * p.ks_a, &sh_flag)) continue;
+        if (!arrive_last(p.ctr_a + run * p.cg_a + group, nproj * ks_a, &sh_flag)) continue;
 
         // Epilogue: (row, 128-chunk) pairs of the group, a warp each
         const int qn = min(GCOLS / KC, p.I / KC - group * (GCOLS / KC));
@@ -563,9 +585,9 @@ void exl3_moe_coop2_a_kernel(const MoeCoop2Params p)
             const int q = group * (GCOLS / KC) + pr % qn;
             const int s = sh_rows[rr];
             const int col = q * KC + lane * 4;
-            const float* pu = p.part_a + (size_t) ((p.gated ? 1 : 0) * p.ks_a) * pstride + (size_t) s * p.I + col;
+            const float* pu = p.part_a + (size_t) ((p.gated ? 1 : 0) * ks_a) * pstride + (size_t) s * p.I + col;
             float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
-            for (int k = 0; k < p.ks_a; ++k)
+            for (int k = 0; k < ks_a; ++k)
             {
                 const float4 v = ldcg4(pu + k * pstride);
                 u0 += v.x; u1 += v.y; u2 += v.z; u3 += v.w;
@@ -577,7 +599,7 @@ void exl3_moe_coop2_a_kernel(const MoeCoop2Params p)
             {
                 const float* pg = p.part_a + (size_t) s * p.I + col;
                 g0 = g1 = g2 = g3 = 0.0f;
-                for (int k = 0; k < p.ks_a; ++k)
+                for (int k = 0; k < ks_a; ++k)
                 {
                     const float4 v = ldcg4(pg + k * pstride);
                     g0 += v.x; g1 += v.y; g2 += v.z; g3 += v.w;
@@ -606,7 +628,7 @@ void exl3_moe_coop2_a_kernel(const MoeCoop2Params p)
 // ---------------------------------------------------------------------------------------------
 // Kernel B: down units; the last arrival per (token row, group) combines the row
 
-__device__ __forceinline__ void combine_row(const MoeCoop2Params& p, int row, int group, float* sh_part)
+__device__ __forceinline__ void combine_row(const MoeCoop2Params& p, int ks_b, int row, int group, float* sh_part)
 {
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -625,7 +647,7 @@ __device__ __forceinline__ void combine_row(const MoeCoop2Params& p, int row, in
             if (e < 0) continue;
             const float* pb = p.part_b + (size_t) s * p.Ho + col;
             float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
-            for (int j = 0; j < p.ks_b; ++j)
+            for (int j = 0; j < ks_b; ++j)
             {
                 const float4 v = ldcg4(pb + j * pstride);
                 v0 += v.x; v1 += v.y; v2 += v.z; v3 += v.w;
@@ -702,13 +724,14 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
 
     const int chunks = p.I / KC;
     const int ntiles = p.Ho / 16;
-    const int n_units = rt.n_runs * p.cg_b * p.ks_b;
+    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, chunks, gridDim.x, p.cap_b / p.slots);
+    const int n_units = rt.n_runs * p.cg_b * ks_b;
 
     for (int u = blockIdx.x; u < n_units; u += gridDim.x)
     {
-        const int ks = u % p.ks_b;
-        const int group = (u / p.ks_b) % p.cg_b;
-        const int run = u / (p.ks_b * p.cg_b);
+        const int ks = u % ks_b;
+        const int group = (u / ks_b) % p.cg_b;
+        const int run = u / (ks_b * p.cg_b);
         const int e = rt.r_exp[run];
         int nrows;
         load_run(rt, run, sh_rows, nrows);
@@ -719,12 +742,12 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
         }
         __syncthreads();
 
-        const int c0 = chunks * ks / p.ks_b;
-        const int c1 = chunks * (ks + 1) / p.ks_b;
+        const int c0 = chunks * ks / ks_b;
+        const int c1 = chunks * (ks + 1) / ks_b;
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[e];
 
         FragC acc[WNT][2];
-        unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, sh_rows, nrows, nullptr, sh_inv, ring, abuf, acc);
+        unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, sh_rows, nrows, nullptr, sh_inv, ring, abuf, 0, acc);
         float* part = p.part_b + (size_t) ks * p.slots * p.Ho;
         store_partials(part, p.Ho, ntiles, group, sh_rows, nrows, acc);
 
@@ -735,7 +758,7 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
         if (threadIdx.x < nrows)
         {
             const int row = sh_rows[threadIdx.x] / p.topk;
-            const int expected = token_active_slots(p, row) * p.ks_b;
+            const int expected = token_active_slots(p, row) * ks_b;
             if (atomicAdd(p.ctr_b + row * p.cg_b + group, 1) == expected - 1)
                 atomicOr(&sh_done, 1u << threadIdx.x);
         }
@@ -745,7 +768,7 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
         __threadfence();
         for (int rr = 0; rr < nrows; ++rr)
             if (done & (1u << rr))
-                combine_row(p, sh_rows[rr] / p.topk, group, (float*) ring);
+                combine_row(p, ks_b, sh_rows[rr] / p.topk, group, (float*) ring);
     }
 }
 

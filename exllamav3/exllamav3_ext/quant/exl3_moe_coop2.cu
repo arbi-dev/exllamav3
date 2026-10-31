@@ -73,25 +73,12 @@ int env_int(const char* name, int dflt)
 
 struct Coop2Plan { int ks_a, ks_b, grid_a, grid_b; };
 
-// k segments per unit: enough units for every resident block slot of the card at the step's
-// slot count (top-k distinct experts per row assumed: duplicates only shrink the run count),
-// rounded to an even split of the chunks. Bounded by the chunks and by the partial-sum scratch
-// (ks * slots <= slots_cap). EXL3_MOE_COOP2_KSA / _KSB force a split (racing)
-int coop2_pick_ks(int units1, int fill, int chunks, int ks_cap, int forced)
-{
-    int ks;
-    if (forced > 0) ks = forced;
-    else
-    {
-        const int want = CEIL_DIVIDE(fill, units1);
-        const int per = std::max(1, CEIL_DIVIDE(chunks, want));
-        ks = CEIL_DIVIDE(chunks, per);
-    }
-    return std::max(1, std::min({ ks, chunks, ks_cap }));
-}
-
-Coop2Plan coop2_plan(int bsz, int topk, int Hi, int I, int Ho, bool gated, int slots_cap, int device,
-                     void* ka, void* kb, int ks_a_req, int ks_b_req)
+// Persistent grids sized to the card (EXL3_MOE_COOP2_FILL scales them, racing), at most one block
+// per possible unit. The k split is the kernels' own per-step choice (pick_ks, from the step's
+// run count) unless forced (ks_a / ks_b, or EXL3_MOE_COOP2_KSA / _KSB); the plan reports the
+// split a step whose slots all pick distinct experts would get (exact for one row).
+Coop2Plan coop2_plan(int bsz, int topk, int Hi, int I, int Ho, bool gated, int cap_a, int cap_b, int device,
+                     void* ka, void* kb, int ks_a_req, int ks_b_req, bool resolve)
 {
     using namespace exl3_moe_coop2_ns;
     const int slots = bsz * topk;
@@ -102,14 +89,16 @@ Coop2Plan coop2_plan(int bsz, int topk, int Hi, int I, int Ho, bool gated, int s
     const int fill_pct = env_int("EXL3_MOE_COOP2_FILL", 100);
     const int fill_a = std::max(1, sms * coop2_occupancy(ka, device) * fill_pct / 100);
     const int fill_b = std::max(1, sms * coop2_occupancy(kb, device) * fill_pct / 100);
-    const int ks_cap = std::max(1, slots_cap / slots);
+    const int ca = Hi / KC, cbk = I / KC;
+    const int kcap_a = std::max(1, std::min(ca, cap_a / slots));
+    const int kcap_b = std::max(1, std::min(cbk, cap_b / slots));
     Coop2Plan pl;
-    const int ua = slots * nproj * cg_a;
-    const int ub = slots * cg_b;
-    pl.ks_a = coop2_pick_ks(ua, fill_a, Hi / KC, ks_cap, ks_a_req > 0 ? ks_a_req : env_int("EXL3_MOE_COOP2_KSA", 0));
-    pl.ks_b = coop2_pick_ks(ub, fill_b, I / KC, ks_cap, ks_b_req > 0 ? ks_b_req : env_int("EXL3_MOE_COOP2_KSB", 0));
-    pl.grid_a = std::min(ua * pl.ks_a, fill_a);
-    pl.grid_b = std::min(ub * pl.ks_b, fill_b);
+    pl.grid_a = std::min(fill_a, slots * nproj * cg_a * kcap_a);
+    pl.grid_b = std::min(fill_b, slots * cg_b * kcap_b);
+    const int fa = ks_a_req > 0 ? ks_a_req : env_int("EXL3_MOE_COOP2_KSA", 0);
+    const int fb = ks_b_req > 0 ? ks_b_req : env_int("EXL3_MOE_COOP2_KSB", 0);
+    pl.ks_a = fa > 0 ? std::min(fa, kcap_a) : (resolve ? exl3_moe_coop2_ns::pick_ks(slots * nproj * cg_a, ca, pl.grid_a, cap_a / slots) : 0);
+    pl.ks_b = fb > 0 ? std::min(fb, kcap_b) : (resolve ? exl3_moe_coop2_ns::pick_ks(slots * cg_b, cbk, pl.grid_b, cap_b / slots) : 0);
     return pl;
 }
 
@@ -119,12 +108,12 @@ int coop2_cb(bool mcg, bool mul1) { return mcg ? 1 : (mul1 ? 2 : 0); }
 
 std::vector<int64_t> exl3_moe_coop2_plan
 (
-    int bsz, int topk, int Hi, int I, int Ho, bool gated, int K_gu, int K_d, int slots_cap, int device,
+    int bsz, int topk, int Hi, int I, int Ho, bool gated, int K_gu, int K_d, int cap_a, int cap_b, int device,
     int ks_a, int ks_b
 )
 {
-    const Coop2Plan pl = coop2_plan(bsz, topk, Hi, I, Ho, gated, slots_cap, device,
-                                    coop2_kernel_a(K_gu, 0), coop2_kernel_b(K_d, 0), ks_a, ks_b);
+    const Coop2Plan pl = coop2_plan(bsz, topk, Hi, I, Ho, gated, cap_a, cap_b, device,
+                                    coop2_kernel_a(K_gu, 0), coop2_kernel_b(K_d, 0), ks_a, ks_b, true);
     return { pl.ks_a, pl.ks_b, pl.grid_a, pl.grid_b };
 }
 
@@ -225,14 +214,15 @@ void exl3_moe_coop2
     const int cb = coop2_cb(mcg, mul1);
     void* ka = coop2_kernel_a(K_gu, cb);
     void* kb = coop2_kernel_b(Kd, cb);
-    const Coop2Plan pl = coop2_plan(p.bsz, p.topk, p.Hi, p.I, p.Ho, gated, slots_cap, device, ka, kb, ks_a, ks_b);
+    const int nproj = gated ? 2 : 1;
+    p.cap_a = (int) std::min<int64_t>(part_a.numel() / ((int64_t) nproj * p.I), 1 << 20);
+    p.cap_b = (int) std::min<int64_t>(part_b.numel() / p.Ho, 1 << 20);
+    TORCH_CHECK(p.cap_a >= p.slots && p.cap_b >= p.slots, "exl3_moe_coop2: partial-sum scratch smaller than the step's slots");
+    const Coop2Plan pl = coop2_plan(p.bsz, p.topk, p.Hi, p.I, p.Ho, gated, p.cap_a, p.cap_b, device, ka, kb, ks_a, ks_b, false);
     p.ks_a = pl.ks_a;
     p.ks_b = pl.ks_b;
     p.cg_a = CEIL_DIVIDE(p.I, GCOLS);
     p.cg_b = CEIL_DIVIDE(p.Ho, GCOLS);
-    const int nproj = gated ? 2 : 1;
-    TORCH_CHECK(part_a.numel() >= (int64_t) nproj * p.ks_a * p.slots * p.I, "exl3_moe_coop2: part_a scratch too small");
-    TORCH_CHECK(part_b.numel() >= (int64_t) p.ks_b * p.slots * p.Ho, "exl3_moe_coop2: part_b scratch too small");
 
     p.part_a = (float*) part_a.data_ptr();
     p.act32 = (float*) act32.data_ptr();

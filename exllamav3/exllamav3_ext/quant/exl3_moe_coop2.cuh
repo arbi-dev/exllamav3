@@ -72,17 +72,19 @@ struct MoeCoop2Params
     int ctr_b_len;
     int cg_a;                   // 256-column groups of I
     int cg_b;                   // 256-column groups of Ho
-    int ks_a;                   // k segments per gate/up unit
-    int ks_b;                   // k segments per down unit
+    int ks_a;                   // k segments per gate/up unit; 0: the kernels pick per step (pick_ks)
+    int ks_b;                   // k segments per down unit; 0: the kernels pick per step
+    int cap_a;                  // part_a capacity in (k segment, slot) rows per projection: ks_a * slots <= cap_a
+    int cap_b;                  // part_b capacity in (k segment, slot) rows: ks_b * slots <= cap_b
     bool act_auto;
 
     float* out;                 // (bsz, H_out), row stride out_stride
     int out_stride;
     const float* sh_out;        // (bsz, H) shared-expert output added to every row, nullable
     int* ovf;                   // fp16-range overflows / non-finite values, nullable, never reset
-    int pfd;                    // L2 prefetch distance in k slices (EXL3_MOE_COOP2_PFD)
+    int pfd;                    // L2 prefetch distance in k slices of a single-wave step's units
     int dbg;                    // EXL3_MOE_COOP2_DBG (profiling): 1 skip dequant+MMA, 2 skip operand staging,
-                                // 4 no L2 prefetch, 8 no evict-first hint
+                                // 4 no unit L2 prefetch, 8 no evict-first hint
 };
 
 // Scratch lengths for a geometry (slots_cap = rows_max * top_k <= MOE_COOP2_MAX_SLOTS)
@@ -120,9 +122,11 @@ void exl3_moe_coop2
     int ks_b
 );
 
-// The launch plan exl3_moe_coop2 would use for this step: {ks_a, ks_b, grid_a, grid_b}
+// The launch plan of a step: {ks_a, ks_b, grid_a, grid_b}; the k splits are those of a step whose
+// slots pick distinct experts (the kernels pick theirs from the step's actual run count).
+// cap_a / cap_b: partial-sum capacities, part_a.numel() / (nproj * I) and part_b.numel() / Ho
 std::vector<int64_t> exl3_moe_coop2_plan
 (
-    int bsz, int topk, int Hi, int I, int Ho, bool gated, int K_gu, int K_d, int slots_cap, int device,
+    int bsz, int topk, int Hi, int I, int Ho, bool gated, int K_gu, int K_d, int cap_a, int cap_b, int device,
     int ks_a, int ks_b
 );
