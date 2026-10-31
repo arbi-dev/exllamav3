@@ -343,6 +343,7 @@ __device__ __forceinline__ void gemv_tile
     const half2* __restrict__ A2,
     size_t a_stride2,
     const int* __restrict__ rows,
+    const int* __restrict__ a_rows,     // A row of each run row (rows, or 0..nrows-1 for staged A)
     int nrows,
     void* __restrict__ C,
     size_t c_stride,
@@ -378,7 +379,7 @@ __device__ __forceinline__ void gemv_tile
     // A fragment row of this lane: rows[lane / 4] of the run
     const int r0 = lane >> 2;
     const bool r0_ok = r0 < nrows;
-    const size_t a_row0 = r0_ok ? (size_t) rows[r0] * a_stride2 : 0;
+    const size_t a_row0 = r0_ok ? (size_t) a_rows[r0] * a_stride2 : 0;
     const half2 hzero = __half2half2(__ushort_as_half(0));
 
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
@@ -624,7 +625,27 @@ __device__ __forceinline__ void rotate_chunk(const MoeCoopParams& p, int row, co
     }
     scale_h4(suh + col, v0, v1, v2, v3);
     had128(v0, v1, v2, v3, lane);
+    if (p.in_scale)
+    {
+        const float s = *p.in_scale;
+        v0 /= s; v1 /= s; v2 /= s; v3 /= s;
+    }
     store_h4(dst + col, v0, v1, v2, v3);
+}
+
+// Overflow counter: one arrival per offending warp
+__device__ __forceinline__ void count_ovf(const MoeCoopParams& p, bool bad, int lane)
+{
+    if (!p.ovf) return;
+    const unsigned m = __ballot_sync(0xffffffffu, bad);
+    if (m && lane == 0) atomicAdd(p.ovf, 1);
+}
+
+__device__ __forceinline__ bool out_of_half(float v0, float v1, float v2, float v3)
+{
+    // !(x <= max) is also true for NaN
+    const float m = 65504.0f;
+    return !(fabsf(v0) <= m) || !(fabsf(v1) <= m) || !(fabsf(v2) <= m) || !(fabsf(v3) <= m);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -747,7 +768,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        gemv_tile<bits, cb, WIDE>(B32, A2, a_stride2, sh_rows, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -777,6 +798,8 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             };
             float u0, u1, u2, u3;
             load_sum(p.gu_u, u0, u1, u2, u3);
+            const float in_s = p.in_scale ? *p.in_scale : 1.0f;
+            if (p.in_scale) { u0 *= in_s; u1 *= in_s; u2 *= in_s; u3 *= in_s; }
             had128(u0, u1, u2, u3, lane);
             scale_h4(((const half*) p.u_svh[local]) + col, u0, u1, u2, u3);
             if (p.u_bias) add_h4(((const half*) p.u_bias[local]) + col, u0, u1, u2, u3);
@@ -785,6 +808,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             if (p.gated)
             {
                 load_sum(p.gu_g, g0, g1, g2, g3);
+                if (p.in_scale) { g0 *= in_s; g1 *= in_s; g2 *= in_s; g3 *= in_s; }
                 had128(g0, g1, g2, g3, lane);
                 scale_h4(((const half*) p.g_svh[local]) + col, g0, g1, g2, g3);
                 if (p.g_bias) add_h4(((const half*) p.g_bias[local]) + col, g0, g1, g2, g3);
@@ -797,7 +821,22 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 
             scale_h4(((const half*) p.d_suh[local]) + col, a0, a1, a2, a3);
             had128(a0, a1, a2, a3, lane);
-            store_h4(p.act_out + off, a0, a1, a2, a3);
+            if (p.act_auto)
+            {
+                // fp32 activation in place of this chunk's (consumed) up result; kernel B scales
+                // it per slot. Only this warp reads gu_u here, and ks = 0's rows are the slot's own
+                *((float4*) (((float*) p.gu_u) + off)) = make_float4(a0, a1, a2, a3);
+            }
+            else
+            {
+                if (p.act_scale)
+                {
+                    const float s = *p.act_scale;
+                    a0 /= s; a1 /= s; a2 /= s; a3 /= s;
+                }
+                count_ovf(p, out_of_half(a0, a1, a2, a3), lane);
+                store_h4(p.act_out + off, a0, a1, a2, a3);
+            }
         }
         __syncthreads();
     }
@@ -819,7 +858,10 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     float* sh_red = (float*) smem_dyn;
     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
     float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits>() ? WK * STAGE_WORDS : 0));
+    half* sh_A = (half*) (sh_part + WK * 128);          // act_auto: (nrows, I) rescaled activation
     __shared__ int sh_flag;
+    __shared__ int sh_ident[ROWS];
+    __shared__ float sh_rmax[WK];
     __shared__ int sh_n_active;
     __shared__ float sh_gate;
     __shared__ int sh_res[4];
@@ -845,10 +887,64 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     const int k_begin = kslices_all * ks / p.ksplit_b;
     const int k_end = kslices_all * (ks + 1) / p.ksplit_b;
 
+    const half2* A2 = (const half2*) p.act_out;
+    const int* a_rows = sh_rows;
+    if (p.act_auto)
+    {
+        // Per slot: peak of the fp32 activation, power-of-two scale bringing it to at most
+        // MOE_COOP_ACT_AUTO_PEAK (1 when it already fits: the stored fp16 values are then those
+        // of the unscaled path), staged as act / scale. Every block of the slot's run computes
+        // the same scale from the same values; the combine reads it back from slot_scale
+        const float* act32 = (const float*) p.gu_u;
+        for (int r = 0; r < nrows; ++r)
+        {
+            const float* src = act32 + (size_t) sh_rows[r] * p.I;
+            float m = 0.0f;
+            bool bad = false;
+            for (int i = threadIdx.x * 4; i < p.I; i += THREADS * 4)
+            {
+                float v0, v1, v2, v3;
+                load_f4_cg(src + i, v0, v1, v2, v3);
+                const float mm = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+                bad = bad || !(mm <= 3.0e38f) || (v0 != v0) || (v1 != v1) || (v2 != v2) || (v3 != v3);
+                m = fmaxf(m, mm);
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            if (group == 0 && ks == 0) count_ovf(p, bad, lane);
+            if (lane == 0) sh_rmax[warp] = m;
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                float mt = 0.0f;
+                for (int w = 0; w < WK; ++w) mt = fmaxf(mt, sh_rmax[w]);
+                float sc = 1.0f;
+                if (mt > MOE_COOP_ACT_AUTO_PEAK)
+                    sc = exp2f(ceilf(log2f(mt / MOE_COOP_ACT_AUTO_PEAK)));
+                sh_rmax[0] = sc;
+                p.slot_scale[sh_rows[r]] = sc;
+            }
+            __syncthreads();
+            const float inv = 1.0f / sh_rmax[0];        // exact: power of two
+            for (int i = threadIdx.x * 4; i < p.I; i += THREADS * 4)
+            {
+                float v0, v1, v2, v3;
+                load_f4_cg(src + i, v0, v1, v2, v3);
+                store_h4(sh_A + (size_t) r * p.I + i, v0 * inv, v1 * inv, v2 * inv, v3 * inv);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x < ROWS) sh_ident[threadIdx.x] = threadIdx.x;
+        __syncthreads();
+        A2 = (const half2*) sh_A;
+        a_rows = sh_ident;
+    }
+
     {
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
-        gemv_tile<bits, cb, WIDE>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+        gemv_tile<bits, cb, WIDE>(B32, A2, (size_t) p.I / 2, sh_rows, a_rows, nrows, C, p.Ho, true,
                                   k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
     }
 
@@ -914,6 +1010,11 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
             }
             had128(v0, v1, v2, v3, lane);
             scale_h4(((const half*) p.d_svh[sj.local]) + col, v0, v1, v2, v3);
+            if (p.act_auto || p.act_scale)
+            {
+                const float s = p.act_auto ? __ldcg(p.slot_scale + sk) : *p.act_scale;
+                v0 *= s; v1 *= s; v2 *= s; v3 *= s;
+            }
             if (p.d_bias) add_h4(((const half*) p.d_bias[sj.local]) + col, v0, v1, v2, v3);
             o0 += sj.w * v0;
             o1 += sj.w * v1;
@@ -941,6 +1042,13 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
                 if (col + 1 < p.H) o1 += gv * sh[1];
                 if (col + 2 < p.H) o2 += gv * sh[2];
                 if (col + 3 < p.H) o3 += gv * sh[3];
+            }
+
+            if (p.ovf)
+            {
+                const bool bad = !(fabsf(o0) <= 3.0e38f) || !(fabsf(o1) <= 3.0e38f) ||
+                                 !(fabsf(o2) <= 3.0e38f) || !(fabsf(o3) <= 3.0e38f);
+                count_ovf(p, bad, lane);
             }
 
             float* dst = p.out + (size_t) row * p.out_stride + col;

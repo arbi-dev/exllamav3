@@ -23,6 +23,13 @@
 #define MGEMM_SLOTS_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
 #define MGEMM_SLOTS_INTS (1 + MGEMM_CHUNKS + MGEMM_MAX_SLOTS)
 
+// Process-wide kernel switches, after the mgemm slot list, written once when the lock buffer is
+// allocated. [0]: exl3_mgemm synchronizes per z-group (group_barrier) instead of the whole grid
+// below sm_90 too (EXL3_MGEMM_GROUP_BARRIER=1). Both are correct under the cooperative launch,
+// which makes every block co-resident; sm_90+ always uses the group barrier
+#define MGEMM_FLAGS_OFFSET (MGEMM_SLOTS_OFFSET + MGEMM_SLOTS_INTS)
+#define MGEMM_FLAGS_INTS 1
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 

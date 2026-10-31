@@ -75,7 +75,29 @@ struct MoeCoopParams
     // Shared expert (nullable): out += gate * sh_out, gate = sigmoid(x . sh_gate_w) or 1
     const float* sh_out;        // (bsz, H), row stride H
     const half* sh_gate_w;      // (H,) or null
+
+    // Range scaling around the fp16 stages (all nullable / off: the unscaled kernels, bit for bit).
+    // in_scale: 0-dim fp32 device scalar; the rotated input is divided by it before the fp16
+    //   store and the gate/up results multiplied back before the activation (exact: both linear)
+    // act_scale: 0-dim fp32 device scalar; the activation is divided by it before the fp16
+    //   act_out store and the down results multiplied back in the combine (exact: down is linear)
+    // act_auto: per-slot power-of-two activation scale chosen in-kernel from the slot's own peak.
+    //   Kernel A stores the activation in fp32 (into gu_u, needs gu_f32); every kernel B block
+    //   reads its run's rows, picks scale = 2^ceil(log2(peak / MOE_COOP_ACT_AUTO_PEAK)) (>= 1)
+    //   and stages act / scale as fp16; the combine multiplies the slot back by it. Exact, no
+    //   host sync, no calibration. Excludes act_scale
+    // ovf: int32 device counter (nullable), incremented when a stage leaves the fp16 range or an
+    //   output is non-finite. Never reset by the kernels
+    const float* in_scale;
+    const float* act_scale;
+    bool act_auto;
+    float* slot_scale;          // (slots_max,) fp32 scratch, act_auto only
+    int* ovf;
 };
+
+// act_auto: the stored activation peak bound. Leaves the down stage's fp16 accumulation
+// (64 products before each fp32 fold) headroom for the trellis weights' magnitude
+#define MOE_COOP_ACT_AUTO_PEAK 1024.0f
 
 // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
 // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
@@ -119,6 +141,18 @@ void exl3_moe_coop_run
     const c10::optional<at::Tensor>& sh_out
 );
 
+// Range-scaled variant of exl3_moe_coop_run (see MoeCoopParams: in_scale / act_scale / act_auto)
+void exl3_moe_coop_run_scaled
+(
+    MoeCoopParams p, int K_gu, int K_d, int cb,
+    const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
+    const c10::optional<at::Tensor>& sh_out,
+    const c10::optional<at::Tensor>& in_scale,
+    const c10::optional<at::Tensor>& act_scale,
+    const c10::optional<at::Tensor>& slot_scale,
+    const c10::optional<at::Tensor>& ovf
+);
+
 // Tensor front end (prepare + run; the test entry point)
 void exl3_moe_coop
 (
@@ -157,3 +191,41 @@ inline int64_t exl3_moe_coop_ctr_len(int64_t slots_max, int64_t bsz_max, int64_t
 {
     return slots_max * (I / 128) + bsz_max * (Ho / 128) + 2 + (slots_max + 1) + slots_max;
 }
+
+// Tensor front end with range scaling. slot_scale (fp32, >= slots of the scratch) given means
+// act_auto (excludes act_scale); in_scale / act_scale are 0-dim fp32 device tensors; ovf a 1-elem
+// int32 device counter. All four nullable: with none this is exl3_moe_coop exactly
+void exl3_moe_coop_scaled
+(
+    const at::Tensor& x,
+    const at::Tensor& sel,
+    const at::Tensor& rw,
+    int min_expert,
+    int max_expert,
+    int Hi,
+    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
+    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
+    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
+    const c10::optional<at::Tensor>& g_bias,
+    const c10::optional<at::Tensor>& u_bias,
+    const c10::optional<at::Tensor>& d_bias,
+    int Kg, int Ku, int Kd,
+    bool mcg, bool mul1,
+    int act,
+    float act_limit,
+    bool gated,
+    at::Tensor& had_g,
+    at::Tensor& had_u,
+    at::Tensor& gu_g,
+    at::Tensor& gu_u,
+    at::Tensor& act_out,
+    at::Tensor& d_out,
+    at::Tensor& ctr,
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& sh_out,
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& in_scale,
+    const c10::optional<at::Tensor>& act_scale,
+    const c10::optional<at::Tensor>& slot_scale,
+    const c10::optional<at::Tensor>& ovf
+);
