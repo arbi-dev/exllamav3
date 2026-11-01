@@ -49,6 +49,21 @@ void* coop2_kernel_b(int K, int cb)
     }
 }
 
+void* coop2_kernel_f(int K, int cb)
+{
+    switch (K)
+    {
+        case 1: return exl3_moe_coop2_kernel_f_k1(cb);
+        case 2: return exl3_moe_coop2_kernel_f_k2(cb);
+        case 3: return exl3_moe_coop2_kernel_f_k3(cb);
+        case 4: return exl3_moe_coop2_kernel_f_k4(cb);
+        case 5: return exl3_moe_coop2_kernel_f_k5(cb);
+        case 6: return exl3_moe_coop2_kernel_f_k6(cb);
+        case 7: return exl3_moe_coop2_kernel_f_k7(cb);
+        default: return exl3_moe_coop2_kernel_f_k8(cb);
+    }
+}
+
 // Resident blocks per SM of a kernel (once per kernel and device)
 int coop2_occupancy(void* kernel, int device)
 {
@@ -104,7 +119,11 @@ Coop2Plan coop2_plan(int bsz, int topk, int Hi, int I, int Ho, bool gated, int c
 
 int coop2_cb(bool mcg, bool mul1) { return mcg ? 1 : (mul1 ? 2 : 0); }
 
+at::Tensor g_trace;
+
 }  // namespace
+
+at::Tensor exl3_moe_coop2_trace() { return g_trace.defined() ? g_trace.cpu() : at::Tensor(); }
 
 std::vector<int64_t> exl3_moe_coop2_plan
 (
@@ -193,7 +212,7 @@ void exl3_moe_coop2
     const int slots_cap = (int) act32.size(0);
     TORCH_CHECK(slots_cap <= MOE_COOP2_MAX_SLOTS && p.slots >= 1 && p.slots <= slots_cap, "exl3_moe_coop2: step slots exceed the scratch");
     TORCH_CHECK(peak.numel() >= (int64_t) slots_cap * (p.I / KC), "exl3_moe_coop2: peak scratch too small");
-    TORCH_CHECK(ctr.numel() >= exl3_moe_coop2_ctr_len(slots_cap, p.I, p.Ho), "exl3_moe_coop2: counter scratch too small");
+    TORCH_CHECK(ctr.numel() >= exl3_moe_coop2_ctr_len_2l(slots_cap, p.I, p.Ho), "exl3_moe_coop2: counter scratch too small");
 
     p.g_trellis = (const int64_t*) g_trellis.data_ptr();
     p.g_suh = (const int64_t*) g_suh.data_ptr();
@@ -208,7 +227,8 @@ void exl3_moe_coop2
     p.act = act;
     p.act_auto = act_auto;
     p.dbg = env_int("EXL3_MOE_COOP2_DBG", 0);
-    p.pfd = env_int("EXL3_MOE_COOP2_PFD", 64);
+    p.pfd = env_int("EXL3_MOE_COOP2_PFD", 0);
+    p.pfd_b = env_int("EXL3_MOE_COOP2_PFD_B", 0);
 
     const int K_gu = gated ? Kg : Ku;
     const int cb = coop2_cb(mcg, mul1);
@@ -249,6 +269,33 @@ void exl3_moe_coop2
     }
 
     void* args[] = { (void*) &p };
+
+    // One launch when gate/up and down share a width and the counter scratch holds the fused
+    // kernel's queue (EXL3_MOE_COOP2_FUSED=0: the two launches, comparison arm)
+    const bool full_ctr = ctr.numel() >= exl3_moe_coop2_ctr_len(slots_cap, p.I, p.Ho);
+    if (full_ctr && !(p.dbg & 64)) p.slot_w = (float*) (p.ctr_b + p.ctr_b_len + 2 + slots_cap);
+    const bool fused = K_gu == Kd && env_int("EXL3_MOE_COOP2_FUSED", 1) != 0 && full_ctr;
+    if (fused)
+    {
+        void* kf = coop2_kernel_f(K_gu, cb);
+        p.fctr = p.ctr_b + p.ctr_b_len;
+        // 80% of the resident slots: the queue keeps the card's DRAM busy with fewer blocks, and
+        // the rest stay free for the kernels a serving step runs beside the mixture on another
+        // stream (the shared expert under moe_shared_overlap), which a full grid would serialise
+        const int fill_pct = env_int("EXL3_MOE_COOP2_FILL", 80);
+        const int fill = std::max(1, DevCtx::instance().get_num_sms(device) * coop2_occupancy(kf, device) * fill_pct / 100);
+        const int ca = p.Hi / KC, cbk = p.I / KC;
+        const int max_units = p.slots * nproj * p.cg_a * std::max(1, std::min(ca, p.cap_a / p.slots)) +
+                              p.slots * p.cg_b * std::max(1, std::min(cbk, p.cap_b / p.slots));
+        const int grid = std::min(fill, max_units);
+        if (env_int("EXL3_MOE_COOP2_TRACE", 0))
+        {
+            g_trace = at::zeros({grid, exl3_moe_coop2_ns::TRACE_W}, x.options().dtype(at::kLong));
+            p.trace = (long long*) g_trace.data_ptr();
+        }
+        cuda_check(cudaLaunchKernel(kf, dim3(grid), dim3(THREADS), args, SMEM_BYTES, stream));
+        return;
+    }
     cuda_check(cudaLaunchKernel(ka, dim3(pl.grid_a), dim3(THREADS), args, SMEM_BYTES, stream));
     cuda_check(cudaLaunchKernel(kb, dim3(pl.grid_b), dim3(THREADS), args, SMEM_BYTES, stream));
 }
