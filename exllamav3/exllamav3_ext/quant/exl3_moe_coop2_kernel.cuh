@@ -367,7 +367,9 @@ __device__ __forceinline__ void stage_chunk
 // its 32 columns' trellis words through a private cp.async ring (no block barrier per slice);
 // one barrier per 128-k chunk for the shared operand buffer. Accumulates in fp32
 
-template <int bits, int cb, bool IS_B>
+struct NoWait { __device__ __forceinline__ void operator()() const {} };
+
+template <int bits, int cb, bool IS_B, typename Wait = NoWait>
 __device__ __forceinline__ void unit_gemv
 (
     const MoeCoop2Params& p,
@@ -380,7 +382,8 @@ __device__ __forceinline__ void unit_gemv
     const float* inv,           // B: per-row inverse activation scale
     uint32_t* ring, half* abuf,
     int pfd,                    // L2 prefetch distance in slices, 0 = none
-    FragC (&acc)[WNT][2]
+    FragC (&acc)[WNT][2],
+    const Wait& wait = Wait()   // block-wide: runs after the weight ring is in flight, before the operand is read
 )
 {
     constexpr int SW = slice_words<bits>();
@@ -423,6 +426,8 @@ __device__ __forceinline__ void unit_gemv
 
     #pragma unroll
     for (int i = 0; i < D - 1; ++i) issue(i);
+
+    wait();
 
     #pragma unroll
     for (int t = 0; t < WNT; ++t)
@@ -505,7 +510,12 @@ __device__ __forceinline__ bool arrive_last(int* counter, int expected, int* sh_
 {
     __threadfence();
     __syncthreads();
-    if (threadIdx.x == 0) *sh_flag = (atomicAdd(counter, 1) == expected - 1);
+    if (threadIdx.x == 0)
+    {
+        const bool l = atomicAdd(counter, 1) == expected - 1;
+        if (l) *counter = 0;
+        *sh_flag = l;
+    }
     __syncthreads();
     const bool last = *sh_flag;
     if (last) __threadfence();
@@ -521,6 +531,111 @@ __device__ __forceinline__ void load_run(const RunTable& rt, int run, int* rows,
 }
 
 // ---------------------------------------------------------------------------------------------
+// Gate/up unit u of the step (u < run count * nproj * cg_a * ks_a); the last arrival per (run,
+// group) runs the epilogue for the group's columns and, when run_ready is set, signals the run's
+// down units (fused kernel)
+
+struct UnitShared
+{
+    int rows[RMAX];
+    float inv[RMAX];
+    int flag;
+    unsigned done;
+    int next;
+};
+
+template <int bits, int cb>
+__device__ __forceinline__ void a_unit
+(
+    const MoeCoop2Params& p, const RunTable& rt, int u, int ks_a, int pfd,
+    uint32_t* ring, half* abuf, UnitShared& us, int* run_ready
+)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int nproj = p.gated ? 2 : 1;
+    const int chunks = p.Hi / KC;
+    const int ntiles = p.I / 16;
+
+    const int ks = u % ks_a;
+    int r = u / ks_a;
+    const int group = r % p.cg_a;
+    r /= p.cg_a;
+    const int proj = r % nproj;
+    const int run = r / nproj;
+    const bool is_gate = p.gated && proj == 0;
+    const int e = rt.r_exp[run];
+    int nrows;
+    load_run(rt, run, us.rows, nrows);
+
+    const int c0 = chunks * ks / ks_a;
+    const int c1 = chunks * (ks + 1) / ks_a;
+    const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[e];
+    const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[e];
+
+    FragC acc[WNT][2];
+    unit_gemv<bits, cb, false>(p, B32, ntiles, group, c0, c1, us.rows, nrows, suh, nullptr, ring, abuf, pfd, acc);
+    float* part = p.part_a + (size_t) (proj * ks_a + ks) * p.slots * p.I;
+    store_partials(part, p.I, ntiles, group, us.rows, nrows, acc);
+
+    if (!arrive_last(p.ctr_a + run * p.cg_a + group, nproj * ks_a, &us.flag)) return;
+
+    // Epilogue: (row, 128-chunk) pairs of the group, a warp each
+    const int qn = min(GCOLS / KC, p.I / KC - group * (GCOLS / KC));
+    const size_t pstride = (size_t) p.slots * p.I;
+    for (int pr = warp; pr < nrows * qn; pr += NW)
+    {
+        const int rr = pr / qn;
+        const int q = group * (GCOLS / KC) + pr % qn;
+        const int s = us.rows[rr];
+        const int col = q * KC + lane * 4;
+        const float* pu = p.part_a + (size_t) ((p.gated ? 1 : 0) * ks_a) * pstride + (size_t) s * p.I + col;
+        float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+        for (int k = 0; k < ks_a; ++k)
+        {
+            const float4 v = ldcg4(pu + k * pstride);
+            u0 += v.x; u1 += v.y; u2 += v.z; u3 += v.w;
+        }
+        had128(u0, u1, u2, u3, lane);
+        scale_h4(((const half*) p.u_svh[e]) + col, u0, u1, u2, u3);
+        float g0 = u0, g1 = u1, g2 = u2, g3 = u3;
+        if (p.gated)
+        {
+            const float* pg = p.part_a + (size_t) s * p.I + col;
+            g0 = g1 = g2 = g3 = 0.0f;
+            for (int k = 0; k < ks_a; ++k)
+            {
+                const float4 v = ldcg4(pg + k * pstride);
+                g0 += v.x; g1 += v.y; g2 += v.z; g3 += v.w;
+            }
+            had128(g0, g1, g2, g3, lane);
+            scale_h4(((const half*) p.g_svh[e]) + col, g0, g1, g2, g3);
+        }
+        float a0 = act_gate(p.act, p.gated, g0, u0);
+        float a1 = act_gate(p.act, p.gated, g1, u1);
+        float a2 = act_gate(p.act, p.gated, g2, u2);
+        float a3 = act_gate(p.act, p.gated, g3, u3);
+        scale_h4(((const half*) p.d_suh[e]) + col, a0, a1, a2, a3);
+        had128(a0, a1, a2, a3, lane);
+        *((float4*) (p.act32 + (size_t) s * p.I + col)) = make_float4(a0, a1, a2, a3);
+        const bool bad = nonfinite4(a0, a1, a2, a3);
+        count_ovf(p, bad, lane);
+        float m = bad ? INFINITY : fmaxf(fmaxf(fabsf(a0), fabsf(a1)), fmaxf(fabsf(a2), fabsf(a3)));
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (lane == 0) p.peak[(size_t) s * (p.I / KC) + q] = m;
+    }
+    if (run_ready)
+    {
+        // Publish the group's activation columns to the run's down units
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) atomicAdd(run_ready + run, 1);
+    }
+    __syncthreads();
+}
+
+// ---------------------------------------------------------------------------------------------
 // Kernel A: gate/up units, epilogue by the last arrival per (run, group)
 
 template <int bits, int cb>
@@ -531,11 +646,7 @@ void exl3_moe_coop2_a_kernel(const MoeCoop2Params p)
     uint32_t* ring = smem;
     half* abuf = (half*) (smem + NW * RING_WORDS);
     __shared__ RunTable rt;
-    __shared__ int sh_rows[RMAX];
-    __shared__ int sh_flag;
-
-    const int warp = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
+    __shared__ UnitShared us;
 
     // Reset the down stage's counters (its previous use finished in stream order)
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS) p.ctr_b[i] = 0;
@@ -543,87 +654,16 @@ void exl3_moe_coop2_a_kernel(const MoeCoop2Params p)
     build_runs(p, rt, ring);
 
     const int nproj = p.gated ? 2 : 1;
-    const int chunks = p.Hi / KC;
-    const int ntiles = p.I / 16;
-    const int ks_a = p.ks_a > 0 ? p.ks_a : pick_ks(rt.n_runs * nproj * p.cg_a, chunks, gridDim.x, p.cap_a / p.slots);
+    const int ks_a = p.ks_a > 0 ? p.ks_a : pick_ks(rt.n_runs * nproj * p.cg_a, p.Hi / KC, gridDim.x, p.cap_a / p.slots);
     const int n_units = rt.n_runs * nproj * p.cg_a * ks_a;
     // A single-wave step streams each unit's weights through L2 prefetches ahead of the ring
     // (several units per block: the prefetches only add traffic)
     const int pfd = (n_units <= (int) gridDim.x && !(p.dbg & 4)) ? p.pfd : 0;
 
     for (int u = blockIdx.x; u < n_units; u += gridDim.x)
-    {
-        const int ks = u % ks_a;
-        int r = u / ks_a;
-        const int group = r % p.cg_a;
-        r /= p.cg_a;
-        const int proj = r % nproj;
-        const int run = r / nproj;
-        const bool is_gate = p.gated && proj == 0;
-        const int e = rt.r_exp[run];
-        int nrows;
-        load_run(rt, run, sh_rows, nrows);
-
-        const int c0 = chunks * ks / ks_a;
-        const int c1 = chunks * (ks + 1) / ks_a;
-        const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[e];
-        const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[e];
-
-        FragC acc[WNT][2];
-        unit_gemv<bits, cb, false>(p, B32, ntiles, group, c0, c1, sh_rows, nrows, suh, nullptr, ring, abuf, pfd, acc);
-        float* part = p.part_a + (size_t) (proj * ks_a + ks) * p.slots * p.I;
-        store_partials(part, p.I, ntiles, group, sh_rows, nrows, acc);
-
-        if (!arrive_last(p.ctr_a + run * p.cg_a + group, nproj * ks_a, &sh_flag)) continue;
-
-        // Epilogue: (row, 128-chunk) pairs of the group, a warp each
-        const int qn = min(GCOLS / KC, p.I / KC - group * (GCOLS / KC));
-        const size_t pstride = (size_t) p.slots * p.I;
-        for (int pr = warp; pr < nrows * qn; pr += NW)
-        {
-            const int rr = pr / qn;
-            const int q = group * (GCOLS / KC) + pr % qn;
-            const int s = sh_rows[rr];
-            const int col = q * KC + lane * 4;
-            const float* pu = p.part_a + (size_t) ((p.gated ? 1 : 0) * ks_a) * pstride + (size_t) s * p.I + col;
-            float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
-            for (int k = 0; k < ks_a; ++k)
-            {
-                const float4 v = ldcg4(pu + k * pstride);
-                u0 += v.x; u1 += v.y; u2 += v.z; u3 += v.w;
-            }
-            had128(u0, u1, u2, u3, lane);
-            scale_h4(((const half*) p.u_svh[e]) + col, u0, u1, u2, u3);
-            float g0 = u0, g1 = u1, g2 = u2, g3 = u3;
-            if (p.gated)
-            {
-                const float* pg = p.part_a + (size_t) s * p.I + col;
-                g0 = g1 = g2 = g3 = 0.0f;
-                for (int k = 0; k < ks_a; ++k)
-                {
-                    const float4 v = ldcg4(pg + k * pstride);
-                    g0 += v.x; g1 += v.y; g2 += v.z; g3 += v.w;
-                }
-                had128(g0, g1, g2, g3, lane);
-                scale_h4(((const half*) p.g_svh[e]) + col, g0, g1, g2, g3);
-            }
-            float a0 = act_gate(p.act, p.gated, g0, u0);
-            float a1 = act_gate(p.act, p.gated, g1, u1);
-            float a2 = act_gate(p.act, p.gated, g2, u2);
-            float a3 = act_gate(p.act, p.gated, g3, u3);
-            scale_h4(((const half*) p.d_suh[e]) + col, a0, a1, a2, a3);
-            had128(a0, a1, a2, a3, lane);
-            *((float4*) (p.act32 + (size_t) s * p.I + col)) = make_float4(a0, a1, a2, a3);
-            const bool bad = nonfinite4(a0, a1, a2, a3);
-            count_ovf(p, bad, lane);
-            float m = bad ? INFINITY : fmaxf(fmaxf(fabsf(a0), fabsf(a1)), fmaxf(fabsf(a2), fabsf(a3)));
-            #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-            if (lane == 0) p.peak[(size_t) s * (p.I / KC) + q] = m;
-        }
-        __syncthreads();
-    }
+        a_unit<bits, cb>(p, rt, u, ks_a, pfd, ring, abuf, us, nullptr);
 }
+
 
 // ---------------------------------------------------------------------------------------------
 // Kernel B: down units; the last arrival per (token row, group) combines the row
@@ -697,6 +737,93 @@ __device__ __forceinline__ void write_empty_row(const MoeCoop2Params& p, int row
     for (int col = threadIdx.x; col < p.H_out; col += THREADS)
         p.out[(size_t) row * p.out_stride + col] = (p.sh_out && col < p.H) ? p.sh_out[(size_t) row * p.H + col] : 0.0f;
 }
+// Down unit u of the step (u < run count * cg_b * ks_b). wait_run (fused kernel): the run's
+// activation is published through run_ready, awaited once the unit's weights are in flight
+template <int bits, int cb>
+__device__ __forceinline__ void b_unit
+(
+    const MoeCoop2Params& p, const RunTable& rt, int u, int ks_b, int pfd,
+    uint32_t* ring, half* abuf, UnitShared& us, const int* run_ready
+)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int chunks = p.I / KC;
+    const int ntiles = p.Ho / 16;
+
+    const int ks = u % ks_b;
+    const int group = (u / ks_b) % p.cg_b;
+    const int run = u / (ks_b * p.cg_b);
+    const int e = rt.r_exp[run];
+    int nrows;
+    load_run(rt, run, us.rows, nrows);
+
+    // Per-row inverse activation scale; after the run's activation is complete
+    auto scales = [&] ()
+    {
+        if (run_ready)
+        {
+            if (threadIdx.x == 0)
+            {
+                const int want = p.cg_a;
+                while (true)
+                {
+                    int v;
+                    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(run_ready + run) : "memory");
+                    if (v >= want) break;
+                    __nanosleep(64);
+                }
+            }
+            __syncthreads();
+        }
+        for (int rr = warp; rr < nrows; rr += NW)
+        {
+            const float sc = slot_scale(p, us.rows[rr], lane);
+            if (lane == 0) us.inv[rr] = 1.0f / sc;      // exact: a power of two
+        }
+        __syncthreads();
+    };
+
+    const int c0 = chunks * ks / ks_b;
+    const int c1 = chunks * (ks + 1) / ks_b;
+    const uint32_t* B32 = (const uint32_t*) p.d_trellis[e];
+
+    FragC acc[WNT][2];
+    if (run_ready)
+        unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, us.rows, nrows, nullptr, us.inv, ring, abuf, pfd, acc, scales);
+    else
+    {
+        scales();
+        unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, us.rows, nrows, nullptr, us.inv, ring, abuf, pfd, acc);
+    }
+    float* part = p.part_b + (size_t) ks * p.slots * p.Ho;
+    store_partials(part, p.Ho, ntiles, group, us.rows, nrows, acc);
+
+    // One arrival per (token row, group) for each of the run's slots (distinct rows)
+    __threadfence();
+    if (threadIdx.x == 0) us.done = 0;
+    __syncthreads();
+    if (threadIdx.x < nrows)
+    {
+        const int row = us.rows[threadIdx.x] / p.topk;
+        const int expected = token_active_slots(p, row) * ks_b;
+        if (atomicAdd(p.ctr_b + row * p.cg_b + group, 1) == expected - 1)
+        {
+            p.ctr_b[row * p.cg_b + group] = 0;
+            atomicOr(&us.done, 1u << threadIdx.x);
+        }
+    }
+    __syncthreads();
+    const unsigned done = us.done;
+    if (done)
+    {
+        __threadfence();
+        for (int rr = 0; rr < nrows; ++rr)
+            if (done & (1u << rr))
+                combine_row(p, ks_b, us.rows[rr] / p.topk, group, (float*) ring);
+    }
+    __syncthreads();
+}
 
 template <int bits, int cb>
 __global__ __launch_bounds__(THREADS, 2)
@@ -706,13 +833,7 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
     uint32_t* ring = smem;
     half* abuf = (half*) (smem + NW * RING_WORDS);
     __shared__ RunTable rt;
-    __shared__ int sh_rows[RMAX];
-    __shared__ float sh_inv[RMAX];
-    __shared__ int sh_flag;
-    __shared__ unsigned sh_done;
-
-    const int warp = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
+    __shared__ UnitShared us;
 
     // Reset the gate/up stage's counters for the next call
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS) p.ctr_a[i] = 0;
@@ -722,53 +843,73 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
 
     build_runs(p, rt, ring);
 
-    const int chunks = p.I / KC;
-    const int ntiles = p.Ho / 16;
-    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, chunks, gridDim.x, p.cap_b / p.slots);
+    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots);
     const int n_units = rt.n_runs * p.cg_b * ks_b;
-
     for (int u = blockIdx.x; u < n_units; u += gridDim.x)
+        b_unit<bits, cb>(p, rt, u, ks_b, 0, ring, abuf, us, nullptr);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fused kernel (one launch, gate/up and down at one bit width): blocks draw units from a ticket
+// queue, every gate/up unit before any down unit. A down unit puts its weights in flight (ring
+// and L2), then waits for its run's activation (run_ready: one count per finished (run, group)
+// epilogue). A block only ever waits holding down tickets, and every gate/up ticket is held by a
+// running block that never waits, so the queue cannot deadlock whatever the residency. The last
+// block out zeroes the queue and run_ready for the next call; the arrival counters reset
+// themselves. Deterministic: the unit decomposition and every reduction order are those of the
+// two-launch kernels, independent of which block runs a unit.
+
+template <int bits, int cb>
+__global__ __launch_bounds__(THREADS, 2)
+void exl3_moe_coop2_f_kernel(const MoeCoop2Params p)
+{
+    extern __shared__ __align__(16) uint32_t smem[];
+    uint32_t* ring = smem;
+    half* abuf = (half*) (smem + NW * RING_WORDS);
+    __shared__ RunTable rt;
+    __shared__ UnitShared us;
+    int* ticket = p.fctr;
+    int* exits = p.fctr + 1;
+    int* run_ready = p.fctr + 2;
+
+    if (threadIdx.x == 0) us.next = atomicAdd(ticket, 1);
+
+    for (int row = blockIdx.x; row < p.bsz; row += gridDim.x)
+        if (token_active_slots(p, row) == 0) write_empty_row(p, row);
+
+    build_runs(p, rt, ring);
+
+    const int nproj = p.gated ? 2 : 1;
+    const int ks_a = p.ks_a > 0 ? p.ks_a : pick_ks(rt.n_runs * nproj * p.cg_a, p.Hi / KC, gridDim.x, p.cap_a / p.slots);
+    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots);
+    const int n_a = rt.n_runs * nproj * p.cg_a * ks_a;
+    const int n_b = rt.n_runs * p.cg_b * ks_b;
+    const int pfd_a = (n_a <= (int) gridDim.x && !(p.dbg & 4)) ? p.pfd : 0;
+    const int pfd_b = (p.dbg & 4) ? 0 : p.pfd_b;
+
+    int u = us.next;            // published by build_runs' barriers
+    while (u < n_a + n_b)
     {
-        const int ks = u % ks_b;
-        const int group = (u / ks_b) % p.cg_b;
-        const int run = u / (ks_b * p.cg_b);
-        const int e = rt.r_exp[run];
-        int nrows;
-        load_run(rt, run, sh_rows, nrows);
-        for (int rr = warp; rr < nrows; rr += NW)
-        {
-            const float sc = slot_scale(p, sh_rows[rr], lane);
-            if (lane == 0) sh_inv[rr] = 1.0f / sc;      // exact: a power of two
-        }
         __syncthreads();
+        if (threadIdx.x == 0) us.next = atomicAdd(ticket, 1);
+        // us.next is read after the unit's own barriers
+        if (u < n_a) a_unit<bits, cb>(p, rt, u, ks_a, pfd_a, ring, abuf, us, run_ready);
+        else b_unit<bits, cb>(p, rt, u - n_a, ks_b, pfd_b, ring, abuf, us, run_ready);
+        u = us.next;
+    }
 
-        const int c0 = chunks * ks / ks_b;
-        const int c1 = chunks * (ks + 1) / ks_b;
-        const uint32_t* B32 = (const uint32_t*) p.d_trellis[e];
-
-        FragC acc[WNT][2];
-        unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, sh_rows, nrows, nullptr, sh_inv, ring, abuf, 0, acc);
-        float* part = p.part_b + (size_t) ks * p.slots * p.Ho;
-        store_partials(part, p.Ho, ntiles, group, sh_rows, nrows, acc);
-
-        // One arrival per (token row, group) for each of the run's slots (distinct rows)
+    // Last block out: every unit of the call is done; zero the queue and the run flags
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
         __threadfence();
-        if (threadIdx.x == 0) sh_done = 0;
-        __syncthreads();
-        if (threadIdx.x < nrows)
-        {
-            const int row = sh_rows[threadIdx.x] / p.topk;
-            const int expected = token_active_slots(p, row) * ks_b;
-            if (atomicAdd(p.ctr_b + row * p.cg_b + group, 1) == expected - 1)
-                atomicOr(&sh_done, 1u << threadIdx.x);
-        }
-        __syncthreads();
-        const unsigned done = sh_done;
-        if (!done) continue;
-        __threadfence();
-        for (int rr = 0; rr < nrows; ++rr)
-            if (done & (1u << rr))
-                combine_row(p, ks_b, sh_rows[rr] / p.topk, group, (float*) ring);
+        us.flag = atomicAdd(exits, 1) == (int) gridDim.x - 1;
+    }
+    __syncthreads();
+    if (us.flag)
+    {
+        for (int i = threadIdx.x; i < rt.n_runs; i += THREADS) run_ready[i] = 0;
+        if (threadIdx.x == 0) { *ticket = 0; *exits = 0; }
     }
 }
 
