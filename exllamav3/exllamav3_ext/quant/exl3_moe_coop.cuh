@@ -24,7 +24,8 @@ struct MoeCoopParams
     const half* x;              // (bsz, H), row stride x_stride
     int x_stride;
     const int64_t* sel;         // (bsz, topk) global expert indices
-    const half* rw;             // (bsz, topk) routing weights
+    const half* rw;             // (bsz, topk) routing weights, fp16 (bf16 when rw_bf16)
+    bool rw_bf16;               // rw holds bf16 (the router's own dtype: no cast launch ahead)
     int bsz;
     int topk;
     int H;                      // x width (the experts' input width before padding)
@@ -93,6 +94,12 @@ struct MoeCoopParams
     bool act_auto;
     float* slot_scale;          // (slots_max,) fp32 scratch, act_auto only
     int* ovf;
+
+    // Down-weight L2 prefetch (kernel A): every gate/up block of a run issues an L2 prefetch of
+    // its share of the run's down trellis before its GEMV, so kernel B reads its weights from L2.
+    // Kernel A at a few rows is latency bound and leaves the DRAM idle half the time; this spends
+    // that on kernel B's bytes. d_bytes: one down trellis in bytes; 0 = off
+    int64_t d_bytes;
 };
 
 // act_auto: the stored activation peak bound. Leaves the down stage's fp16 accumulation
@@ -229,3 +236,8 @@ void exl3_moe_coop_scaled
     const c10::optional<at::Tensor>& slot_scale,
     const c10::optional<at::Tensor>& ovf
 );
+
+// What the loaded binary's coop entries accept beyond the first release, as a bit set read by the
+// caller instead of a version: 1 = bf16 routing weights (exl3_moe_coop*, exl3_moe_coop2)
+#define EXL3_MOE_COOP_CAP_RW_BF16 1
+inline int64_t exl3_moe_coop_caps() { return EXL3_MOE_COOP_CAP_RW_BF16; }

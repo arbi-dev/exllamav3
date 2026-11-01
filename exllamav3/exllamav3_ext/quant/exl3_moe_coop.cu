@@ -46,9 +46,11 @@ static MoeCoopKernel moe_coop_kernel_b(int K, int cb, bool wide)
     }
 }
 
-// Split-k factor: blocks per column chunk, partial outputs summed by the last-arriving block.
-// Measured ineffective.
-static int moe_coop_pick_ksplit(int max_split)
+// Split-k factor: blocks per column chunk, partial outputs summed by the last-arriving block. A
+// stage whose grid leaves at least half the card idle (a 1-row step on a wide card: 48 gate/up
+// blocks of Flint on 128 SMs) splits k so the grid covers it; otherwise 1 (on a card the grid
+// already covers, more blocks only add partial-sum traffic). EXL3_MOE_COOP_KSPLIT forces it
+static int moe_coop_pick_ksplit(int max_split, int base_grid, int sms)
 {
     static int forced = -2;
     if (forced == -2)
@@ -56,7 +58,20 @@ static int moe_coop_pick_ksplit(int max_split)
         const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT");
         forced = env ? atoi(env) : 0;
     }
-    return forced > 0 ? std::min(forced, max_split) : 1;
+    if (forced > 0) return std::min(forced, max_split);
+    return std::max(1, std::min({ max_split, 2, sms / std::max(1, base_grid) }));
+}
+
+// Down-weight L2 prefetch from kernel A (MoeCoopParams::d_bytes): EXL3_MOE_COOP_PFD=0 turns it off
+static bool moe_coop_pfd_on()
+{
+    static int on = -1;
+    if (on == -1)
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_PFD");
+        on = env ? (atoi(env) != 0) : 1;
+    }
+    return on != 0;
 }
 
 // Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
@@ -111,8 +126,10 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
     const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
     const int max_split = std::max(1, p.slots_max / slots);
-    p.ksplit_a = moe_coop_pick_ksplit(max_split);
-    p.ksplit_b = moe_coop_pick_ksplit(max_split);
+    const int sms = DevCtx::instance().get_num_sms(device);
+    p.ksplit_a = moe_coop_pick_ksplit(max_split, base_a, sms);
+    p.ksplit_b = moe_coop_pick_ksplit(max_split, base_b, sms);
+    p.d_bytes = moe_coop_pfd_on() ? (int64_t) p.I * p.Ho * K_d / 8 : 0;
     const int grid_a = base_a * p.ksplit_a;
     const int grid_b = base_b * p.ksplit_b;
 
@@ -308,6 +325,7 @@ void exl3_moe_coop_run_scaled
     p.topk = (int) sel.size(-1);
     p.sel = (const int64_t*) sel.data_ptr();
     p.rw = (const half*) rw.data_ptr();
+    p.rw_bf16 = rw.scalar_type() == at::kBFloat16;
     const int slots = p.bsz * p.topk;
     TORCH_CHECK(p.H % 4 == 0 && p.H <= p.Hi, "exl3_moe_coop: H/Hi shape");
     TORCH_CHECK(slots <= p.slots_max && p.bsz <= p.rows_max, "exl3_moe_coop: batch exceeds the scratch");
@@ -360,7 +378,7 @@ static void exl3_moe_coop_impl
 {
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(sel, kLong);
-    TORCH_CHECK_DTYPE(rw, kHalf);
+    TORCH_CHECK(rw.scalar_type() == at::kHalf || rw.scalar_type() == at::kBFloat16, "exl3_moe_coop: rw must be fp16 or bf16");
     TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous(), "exl3_moe_coop: sel/rw must be contiguous");
     TORCH_CHECK(sel.sizes() == rw.sizes() && sel.dim() == 2 && sel.size(0) == x.size(0), "exl3_moe_coop: sel/rw must be (bsz, topk)");
     if (sh_out)

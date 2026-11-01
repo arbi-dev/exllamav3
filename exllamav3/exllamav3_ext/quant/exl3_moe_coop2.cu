@@ -171,7 +171,7 @@ void exl3_moe_coop2
 
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(sel, kLong);
-    TORCH_CHECK_DTYPE(rw, kHalf);
+    TORCH_CHECK(rw.scalar_type() == at::kHalf || rw.scalar_type() == at::kBFloat16, "exl3_moe_coop2: rw must be fp16 or bf16");
     TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1 && x.stride(0) % 4 == 0, "exl3_moe_coop2: x must be (bsz, H), unit column stride, row stride a multiple of 4");
     TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous() && sel.sizes() == rw.sizes() && sel.dim() == 2 && sel.size(0) == x.size(0),
                 "exl3_moe_coop2: sel / rw must be contiguous (bsz, top_k)");
@@ -192,6 +192,7 @@ void exl3_moe_coop2
     p.x_stride = (int) x.stride(0);
     p.sel = (const int64_t*) sel.data_ptr();
     p.rw = (const half*) rw.data_ptr();
+    p.rw_bf16 = rw.scalar_type() == at::kBFloat16;
     p.bsz = (int) x.size(0);
     p.topk = (int) sel.size(1);
     p.slots = p.bsz * p.topk;
