@@ -22,6 +22,7 @@
 // actual run count exit at once.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "../util.h"
 #include "../util.cuh"
 #include "../compat.cuh"
@@ -209,7 +210,7 @@ __device__ __forceinline__ SlotInfo slot_info(const MoeCoopParams& p, int s)
     SlotInfo si;
     si.row = s / p.topk;
     int64_t e = p.sel[s];
-    si.w = __half2float(p.rw[s]);
+    si.w = p.rw_bf16 ? __bfloat162float(((const __nv_bfloat16*) p.rw)[s]) : __half2float(p.rw[s]);
     bool ok = si.w != 0.0f;
     if (p.min_expert >= 0)
     {

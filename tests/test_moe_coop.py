@@ -90,7 +90,8 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
         for r in (0, bsz - 1):
             sel[r] = torch.tensor([foreign[k % len(foreign)] for k in range(topk)])
     sel = sel.to(DEV)
-    rw = (torch.rand((bsz, topk), generator = gen) * 0.9 + 0.1).half().to(DEV)
+    # bf16-representable weights (a router's own dtype), so the bf16 entry must match the fp16 one bitwise
+    rw = (torch.rand((bsz, topk), generator = gen) * 0.9 + 0.1).bfloat16().half().to(DEV)
     if bsz * topk > 1:
         rw[0, 0] = 0.0     # a zero-weight slot must contribute nothing and not break anything
     first = 0 if min_e < 0 else min_e
@@ -136,7 +137,7 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
     gK = gate.K if gated else up.K
     gbias = gate.bias_tab if gated else None
 
-    def run():
+    def run(rw = rw):
         ext.exl3_moe_coop(
             x, sel, rw, min_e, max_e, Hi,
             *gtabs, *up.tabs, *down.tabs,
@@ -152,6 +153,7 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
     o1 = run()
     o2 = run()
     assert torch.equal(o1, o2), "not bit-reproducible"
+    assert torch.equal(o1, run(rw.bfloat16())), "bf16 routing weights differ from their fp16 copy"
     assert torch.isfinite(o1).all()
     scale = ref.abs().max().item()
     err = (o1 - ref).abs().max().item()
@@ -237,3 +239,7 @@ def test_odd_shapes():
     # k-slices not divisible by the 16-warp split, several column groups
     run_case(16, 4, 4, 4, 1, H = 640, Hi = 640, I = 896, Ho = 640, H_out = 640)
     run_case(17, 6, 6, 6, 2, H = 384, Hi = 384, I = 1152, Ho = 384, H_out = 384)
+
+
+def test_caps():
+    assert ext.exl3_moe_coop_caps() & 1, "the coop entries take bf16 routing weights"

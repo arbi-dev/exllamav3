@@ -24,7 +24,8 @@ struct MoeCoopParams
     const half* x;              // (bsz, H), row stride x_stride
     int x_stride;
     const int64_t* sel;         // (bsz, topk) global expert indices
-    const half* rw;             // (bsz, topk) routing weights
+    const half* rw;             // (bsz, topk) routing weights, fp16 (bf16 when rw_bf16)
+    bool rw_bf16;               // rw holds bf16 (the router's own dtype: no cast launch ahead)
     int bsz;
     int topk;
     int H;                      // x width (the experts' input width before padding)
@@ -229,3 +230,8 @@ void exl3_moe_coop_scaled
     const c10::optional<at::Tensor>& slot_scale,
     const c10::optional<at::Tensor>& ovf
 );
+
+// What the loaded binary's coop entries accept beyond the first release, as a bit set read by the
+// caller instead of a version: 1 = bf16 routing weights (exl3_moe_coop*, exl3_moe_coop2)
+#define EXL3_MOE_COOP_CAP_RW_BF16 1
+inline int64_t exl3_moe_coop_caps() { return EXL3_MOE_COOP_CAP_RW_BF16; }
