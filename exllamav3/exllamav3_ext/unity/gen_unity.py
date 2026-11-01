@@ -20,10 +20,11 @@ softcap, pack, util, moe_handoff. Device code is unaffected either way; every
 kernel's SASS is the same in or out of a group. The kernel-instance units under
 quant/comp_units stay separate as well.
 
-HYGIENE. After each member, every macro that member #defines at file scope is
-#undef'd, so one file's private NUM_THREADS etc. never reaches the next. Two
-members that define the same file-scope static/anonymous-namespace name do not
-compile; split them into different groups.
+HYGIENE. Every macro a member #defines at file scope is saved with
+push_macro before the member and restored with pop_macro after it, so one
+file's private NUM_THREADS never reaches the next, and a macro a shared header
+defined before the member (CLAMP) is still defined after it. Two members that
+define the same function do not compile; split them into different groups.
 
 ext.py and setup.py compile every *.cu here and skip every file a unity unit
 names, so a file is compiled exactly once either way.
@@ -45,40 +46,45 @@ EXT = os.path.dirname(HERE)
 #   * two files that include the same header with no include guard
 #     (activation_kernels.cuh, parallel/barrier_inner.cuh) are never grouped;
 #   * gumbel.cu / sampling_basic.cu / sampling_extra.cu each define gumbel();
-#   * norm.cu defines _silu(), as does activation_kernels.cuh;
+#   * norm.cu and gdn.cu define _silu() / _sigmoid_fast_exp(), as does
+#     activation_kernels.cuh (included by activation.cu and exl3_moe_coop.cu);
 #   * parallel/{all_reduce,all_reduce_cpu,barrier,broadcast,gather}.cu stay
 #     separate: their kernels printf, and the format strings live in a
 #     per-module constant bank whose offsets would shift with the neighbours.
 GROUPS: list[list[str]] = [
     [
-        "activation.cu",
-        "gdn.cu",
         "generator/gumbel.cu",
-        "moe_unswizzle.cu",
-        "ngram.cu",
+        "generator/rep_pen.cu",
         "ple.cu",
         "routing.cu",
         "stloader_cu.cu",
     ],
     [
-        "attention.cu",
+        "activation.cu",
         "dsa_topk.cu",
-        "generator/rep_pen.cu",
-        "generator/sampling_extra.cu",
         "hc_mix.cu",
-        "norm.cu",
+    ],
+    [
+        "dsv4_compress.cu",
+        "dsv4_pool_quant.cu",
+        "generator/dry.cu",
+        "generator/sampling_basic.cu",
+        "moe_unswizzle.cu",
+    ],
+    [
+        "cache/q_cache.cu",
+        "gdn.cu",
         "parallel/context.cu",
         "rope.cu",
     ],
     [
-        "cache/q_cache.cu",
-        "dsv4_compress.cu",
-        "dsv4_pool_quant.cu",
+        "attention.cu",
         "generator/cache.cu",
-        "generator/dry.cu",
-        "generator/sampling_basic.cu",
+        "generator/sampling_extra.cu",
         "generator/sampling_fused.cu",
         "histogram.cu",
+        "ngram.cu",
+        "norm.cu",
     ],
 ]
 
@@ -94,8 +100,10 @@ def render(group: list[str]) -> str:
     for rel in group:
         with open(os.path.join(EXT, rel), encoding="utf-8") as fh:
             body = fh.read()
+        names = sorted(set(_DEFINE.findall(body)))
+        lines.extend(f'#pragma push_macro("{name}")' for name in names)
         lines.append(f'#include "../{rel}"')
-        lines.extend(f"#undef {name}" for name in sorted(set(_DEFINE.findall(body))))
+        lines.extend(f'#pragma pop_macro("{name}")' for name in names)
     return "\n".join(lines) + "\n"
 
 
