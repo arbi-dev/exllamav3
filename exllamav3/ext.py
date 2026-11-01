@@ -141,6 +141,24 @@ else:
         if file.endswith(('.c', '.cpp', '.cu'))
     ]
 
+    # unity/*.cu compile the torch-including launcher files a few to a translation
+    # unit (unity/gen_unity.py says why); each file a unity unit includes is
+    # compiled there and nowhere else.
+    def _unity_members(sources_dir):
+        unity_dir = os.path.join(sources_dir, "unity")
+        members = set()
+        if os.path.isdir(unity_dir):
+            for fn in os.listdir(unity_dir):
+                if fn.endswith(".cu"):
+                    with open(os.path.join(unity_dir, fn), encoding="utf-8") as fh:
+                        for line in fh:
+                            if line.startswith('#include "../'):
+                                members.add(os.path.normpath(os.path.join(unity_dir, line[len('#include "'):].strip().rstrip('"'))))
+        return members
+
+    _members = _unity_members(os.path.abspath(sources_dir))
+    sources = [s for s in sources if os.path.abspath(s) not in _members]
+
     # Load extension
 
     maybe_set_arch_list_env()
