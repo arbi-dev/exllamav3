@@ -94,12 +94,6 @@ struct MoeCoopParams
     bool act_auto;
     float* slot_scale;          // (slots_max,) fp32 scratch, act_auto only
     int* ovf;
-
-    // Down-weight L2 prefetch (kernel A): every gate/up block of a run issues an L2 prefetch of
-    // its share of the run's down trellis before its GEMV, so kernel B reads its weights from L2.
-    // Kernel A at a few rows is latency bound and leaves the DRAM idle half the time; this spends
-    // that on kernel B's bytes. d_bytes: one down trellis in bytes; 0 = off
-    int64_t d_bytes;
 };
 
 // act_auto: the stored activation peak bound. Leaves the down stage's fp16 accumulation

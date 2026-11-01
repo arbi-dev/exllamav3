@@ -740,21 +740,6 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         return;
     }
     const int local = slot_info(p, sh_rows[0]).local;
-
-    // This block's share of the run's down trellis into L2 (see MoeCoopParams::d_bytes): the run's
-    // nproj * ng * ksplit_a gate/up blocks split it in 128-byte lines
-    if (p.d_bytes > 0)
-    {
-        const int parts = nproj * ng * p.ksplit_a;
-        const int part = (is_gate ? 0 : 1) * (p.gated ? 1 : 0) + nproj * (ks + p.ksplit_a * group);
-        const int64_t lines = p.d_bytes / 128;
-        const int64_t l0 = lines * part / parts;
-        const int64_t l1 = lines * (part + 1) / parts;
-        const char* base = (const char*) p.d_trellis[local];
-        for (int64_t l = l0 + threadIdx.x; l < l1; l += THREADS)
-            asm volatile("prefetch.global.L2 [%0];" :: "l"(base + l * 128));
-    }
-
     const int kslices_all = p.Hi / 16;
     const int k_begin = kslices_all * ks / p.ksplit_a;
     const int k_end = kslices_all * (ks + 1) / p.ksplit_a;

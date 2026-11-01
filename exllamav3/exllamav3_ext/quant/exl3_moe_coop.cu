@@ -62,18 +62,6 @@ static int moe_coop_pick_ksplit(int max_split, int base_grid, int sms)
     return std::max(1, std::min({ max_split, 2, sms / std::max(1, base_grid) }));
 }
 
-// Down-weight L2 prefetch from kernel A (MoeCoopParams::d_bytes): EXL3_MOE_COOP_PFD=0 turns it off
-static bool moe_coop_pfd_on()
-{
-    static int on = -1;
-    if (on == -1)
-    {
-        const char* env = std::getenv("EXL3_MOE_COOP_PFD");
-        on = env ? (atoi(env) != 0) : 1;
-    }
-    return on != 0;
-}
-
 // Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
 // otherwise. EXL3_MOE_COOP_WIDE = 0 / 1 forces one geometry for every stage (testing)
 static int moe_coop_wide_mode()
@@ -129,7 +117,6 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const int sms = DevCtx::instance().get_num_sms(device);
     p.ksplit_a = moe_coop_pick_ksplit(max_split, base_a, sms);
     p.ksplit_b = moe_coop_pick_ksplit(max_split, base_b, sms);
-    p.d_bytes = moe_coop_pfd_on() ? (int64_t) p.I * p.Ho * K_d / 8 : 0;
     const int grid_a = base_a * p.ksplit_a;
     const int grid_b = base_b * p.ksplit_b;
 
