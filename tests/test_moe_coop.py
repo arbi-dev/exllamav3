@@ -81,7 +81,8 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
     gate = Proj(Hi, I, Kg, cb, bias, gen, E) if gated else None
     up = Proj(Hi, I, Ku, cb, bias, gen, E)
     down = Proj(I, Ho, Kd, cb, bias, gen, E)
-    x = (torch.randn((bsz, H), generator = gen) * 0.05).half().to(DEV)
+    # bf16-representable rows, so the bf16 entry (the caller's hidden state as it is) must match the fp16 one bitwise
+    x = (torch.randn((bsz, H), generator = gen) * 0.05).bfloat16().half().to(DEV)
     n_global = E if min_e < 0 else E + 4    # global expert space with 4 foreign experts
     sel = torch.stack([torch.randperm(n_global, generator = gen)[:topk] for _ in range(bsz)])
     if empty_rows:
@@ -137,7 +138,7 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
     gK = gate.K if gated else up.K
     gbias = gate.bias_tab if gated else None
 
-    def run(rw = rw):
+    def run(rw = rw, x = x):
         ext.exl3_moe_coop(
             x, sel, rw, min_e, max_e, Hi,
             *gtabs, *up.tabs, *down.tabs,
@@ -154,6 +155,8 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
     o2 = run()
     assert torch.equal(o1, o2), "not bit-reproducible"
     assert torch.equal(o1, run(rw.bfloat16())), "bf16 routing weights differ from their fp16 copy"
+    if sh_w is None:
+        assert torch.equal(o1, run(x = x.bfloat16())), "bf16 input rows differ from their fp16 copy"
     assert torch.isfinite(o1).all()
     scale = ref.abs().max().item()
     err = (o1 - ref).abs().max().item()
@@ -243,3 +246,4 @@ def test_odd_shapes():
 
 def test_caps():
     assert ext.exl3_moe_coop_caps() & 1, "the coop entries take bf16 routing weights"
+    assert ext.exl3_moe_coop_caps() & 2, "the coop entries take bf16 input rows"

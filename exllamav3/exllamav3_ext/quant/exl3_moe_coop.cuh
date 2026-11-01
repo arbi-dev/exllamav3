@@ -21,7 +21,8 @@
 struct MoeCoopParams
 {
     // Inputs
-    const half* x;              // (bsz, H), row stride x_stride
+    const half* x;              // (bsz, H), row stride x_stride; fp16, or bf16 when x_bf16
+    bool x_bf16;                // x holds bf16 (the caller's hidden state as it is: no cast, no copy)
     int x_stride;
     const int64_t* sel;         // (bsz, topk) global expert indices
     const half* rw;             // (bsz, topk) routing weights, fp16 (bf16 when rw_bf16)
@@ -232,6 +233,7 @@ void exl3_moe_coop_scaled
 );
 
 // What the loaded binary's coop entries accept beyond the first release, as a bit set read by the
-// caller instead of a version: 1 = bf16 routing weights (exl3_moe_coop*, exl3_moe_coop2)
+// caller instead of a version: 1 = bf16 routing weights, 2 = bf16 input rows (exl3_moe_coop*, exl3_moe_coop2)
 #define EXL3_MOE_COOP_CAP_RW_BF16 1
-inline int64_t exl3_moe_coop_caps() { return EXL3_MOE_COOP_CAP_RW_BF16; }
+#define EXL3_MOE_COOP_CAP_X_BF16 2
+inline int64_t exl3_moe_coop_caps() { return EXL3_MOE_COOP_CAP_RW_BF16 | EXL3_MOE_COOP_CAP_X_BF16; }

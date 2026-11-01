@@ -348,19 +348,40 @@ __device__ __forceinline__ void stage_chunk
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
         if constexpr (!IS_B)
         {
-            const half* xr = p.x + (size_t) (s / p.topk) * p.x_stride;
-            if (col + 3 < p.H)
+            const size_t xo = (size_t) (s / p.topk) * p.x_stride;
+            if (p.x_bf16)
             {
-                const uint2 u = *((const uint2*) (xr + col));
-                const half2 a = *reinterpret_cast<const half2*>(&u.x);
-                const half2 b = *reinterpret_cast<const half2*>(&u.y);
-                v0 = __low2float(a); v1 = __high2float(a); v2 = __low2float(b); v3 = __high2float(b);
+                const __nv_bfloat16* xr = ((const __nv_bfloat16*) p.x) + xo;
+                if (col + 3 < p.H)
+                {
+                    const uint2 u = *((const uint2*) (xr + col));
+                    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+                    const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+                    v0 = a.x; v1 = a.y; v2 = b.x; v3 = b.y;
+                }
+                else
+                {
+                    if (col + 0 < p.H) v0 = __bfloat162float(xr[col + 0]);
+                    if (col + 1 < p.H) v1 = __bfloat162float(xr[col + 1]);
+                    if (col + 2 < p.H) v2 = __bfloat162float(xr[col + 2]);
+                }
             }
             else
             {
-                if (col + 0 < p.H) v0 = __half2float(xr[col + 0]);
-                if (col + 1 < p.H) v1 = __half2float(xr[col + 1]);
-                if (col + 2 < p.H) v2 = __half2float(xr[col + 2]);
+                const half* xr = p.x + xo;
+                if (col + 3 < p.H)
+                {
+                    const uint2 u = *((const uint2*) (xr + col));
+                    const half2 a = *reinterpret_cast<const half2*>(&u.x);
+                    const half2 b = *reinterpret_cast<const half2*>(&u.y);
+                    v0 = __low2float(a); v1 = __high2float(a); v2 = __low2float(b); v3 = __high2float(b);
+                }
+                else
+                {
+                    if (col + 0 < p.H) v0 = __half2float(xr[col + 0]);
+                    if (col + 1 < p.H) v1 = __half2float(xr[col + 1]);
+                    if (col + 2 < p.H) v2 = __half2float(xr[col + 2]);
+                }
             }
             scale_h4(suh + col, v0, v1, v2, v3);
             had128(v0, v1, v2, v3, lane);
