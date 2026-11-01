@@ -42,10 +42,12 @@
 
 struct MoeCoop2Params
 {
-    const half* x;              // (bsz, H), row stride x_stride
+    const half* x;              // (bsz, H), row stride x_stride; fp16, or bf16 when x_bf16
+    bool x_bf16;                // x holds bf16 (the caller's hidden state as it is: no cast, no copy)
     int x_stride;
     const int64_t* sel;         // (bsz, topk) global expert ids
-    const half* rw;             // (bsz, topk) routing weights; 0 = inactive slot
+    const half* rw;             // (bsz, topk) routing weights, fp16 (bf16 when rw_bf16); 0 = inactive slot
+    bool rw_bf16;               // rw holds bf16 (the router's own dtype: no cast launch ahead)
     int bsz;
     int topk;
     int slots;                  // bsz * topk

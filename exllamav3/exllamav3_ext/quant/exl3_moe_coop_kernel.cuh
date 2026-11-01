@@ -22,6 +22,7 @@
 // actual run count exit at once.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "../util.h"
 #include "../util.cuh"
 #include "../compat.cuh"
@@ -196,6 +197,20 @@ __device__ __forceinline__ void add_h4(const half* p, float& v0, float& v1, floa
     v0 += s0; v1 += s1; v2 += s2; v3 += s3;
 }
 
+// One input element / an aligned pair of a token row (fp16 or bf16 storage, see MoeCoopParams::x_bf16)
+__device__ __forceinline__ float x_one(const MoeCoopParams& p, int row, int i)
+{
+    const size_t o = (size_t) row * p.x_stride + i;
+    return p.x_bf16 ? __bfloat162float(((const __nv_bfloat16*) p.x)[o]) : __half2float(p.x[o]);
+}
+
+__device__ __forceinline__ float2 x_pair(const MoeCoopParams& p, int row, int i)
+{
+    const size_t o = (size_t) row * p.x_stride + i;
+    if (p.x_bf16) return __bfloat1622float2(*((const __nv_bfloat162*) (((const __nv_bfloat16*) p.x) + o)));
+    return __half22float2(*((const half2*) (p.x + o)));
+}
+
 struct SlotInfo
 {
     int row;
@@ -209,7 +224,7 @@ __device__ __forceinline__ SlotInfo slot_info(const MoeCoopParams& p, int s)
     SlotInfo si;
     si.row = s / p.topk;
     int64_t e = p.sel[s];
-    si.w = __half2float(p.rw[s]);
+    si.w = p.rw_bf16 ? __bfloat162float(((const __nv_bfloat16*) p.rw)[s]) : __half2float(p.rw[s]);
     bool ok = si.w != 0.0f;
     if (p.min_expert >= 0)
     {
@@ -579,13 +594,12 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
         float gv = 1.0f;
         if (p.sh_gate_w)
         {
-            const half* xr = p.x + (size_t) row * p.x_stride;
             float dot = 0.0f;
             for (int i = lane * 2; i < p.H; i += 64)
             {
-                half2 xv = *((const half2*) (xr + i));
+                const float2 xv = x_pair(p, row, i);
                 half2 wv = *((const half2*) (p.sh_gate_w + i));
-                dot += __low2float(xv) * __low2float(wv) + __high2float(xv) * __high2float(wv);
+                dot += xv.x * __low2float(wv) + xv.y * __high2float(wv);
             }
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)
@@ -613,15 +627,22 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
 __device__ __forceinline__ void rotate_chunk(const MoeCoopParams& p, int row, const half* suh, int c, half* dst, int lane)
 {
     const int col = c * 128 + lane * 4;
-    const half* xr = p.x + (size_t) row * p.x_stride;
     float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
     if (col + 3 < p.H)
-        load_h4(xr + col, v0, v1, v2, v3);
+    {
+        if (p.x_bf16)
+        {
+            const float2 a = x_pair(p, row, col), b = x_pair(p, row, col + 2);
+            v0 = a.x; v1 = a.y; v2 = b.x; v3 = b.y;
+        }
+        else
+            load_h4(p.x + (size_t) row * p.x_stride + col, v0, v1, v2, v3);
+    }
     else
     {
-        if (col + 0 < p.H) v0 = __half2float(xr[col + 0]);
-        if (col + 1 < p.H) v1 = __half2float(xr[col + 1]);
-        if (col + 2 < p.H) v2 = __half2float(xr[col + 2]);
+        if (col + 0 < p.H) v0 = x_one(p, row, col + 0);
+        if (col + 1 < p.H) v1 = x_one(p, row, col + 1);
+        if (col + 2 < p.H) v2 = x_one(p, row, col + 2);
     }
     scale_h4(suh + col, v0, v1, v2, v3);
     had128(v0, v1, v2, v3, lane);
@@ -972,13 +993,12 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
         // Shared-expert gate: sigmoid(x_row . w), fp32 across the block
         if (p.sh_gate_w)
         {
-            const half* xr = p.x + (size_t) row * p.x_stride;
             float dot = 0.0f;
             for (int i = threadIdx.x * 2; i < p.H; i += THREADS * 2)
             {
-                half2 xv = *((const half2*) (xr + i));
+                const float2 xv = x_pair(p, row, i);
                 half2 wv = *((const half2*) (p.sh_gate_w + i));
-                dot += __low2float(xv) * __low2float(wv) + __high2float(xv) * __high2float(wv);
+                dot += xv.x * __low2float(wv) + xv.y * __high2float(wv);
             }
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)

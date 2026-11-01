@@ -4,6 +4,7 @@
 // in comp_units/exl3_moe_coop2_inst_k*.cu.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "../util.h"
 #include "../util.cuh"
 #include "../compat.cuh"
@@ -122,11 +123,17 @@ __device__ __forceinline__ bool nonfinite4(float a, float b, float c, float d)
     return !(fabsf(a) <= m) || !(fabsf(b) <= m) || !(fabsf(c) <= m) || !(fabsf(d) <= m);
 }
 
+// Routing weight of a slot (fp16 or bf16 storage)
+__device__ __forceinline__ float slot_rw(const MoeCoop2Params& p, int s)
+{
+    return p.rw_bf16 ? __bfloat162float(((const __nv_bfloat16*) p.rw)[s]) : __half2float(p.rw[s]);
+}
+
 // Local expert of a slot, -1 when inactive (zero weight, or another rank's expert)
 __device__ __forceinline__ int slot_local(const MoeCoop2Params& p, int s)
 {
     int64_t e = p.sel[s];
-    if (__half2float(p.rw[s]) == 0.0f) return -1;
+    if (slot_rw(p, s) == 0.0f) return -1;
     if (p.min_expert >= 0)
     {
         if (e < p.min_expert || e >= p.max_expert) return -1;
@@ -341,19 +348,40 @@ __device__ __forceinline__ void stage_chunk
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
         if constexpr (!IS_B)
         {
-            const half* xr = p.x + (size_t) (s / p.topk) * p.x_stride;
-            if (col + 3 < p.H)
+            const size_t xo = (size_t) (s / p.topk) * p.x_stride;
+            if (p.x_bf16)
             {
-                const uint2 u = *((const uint2*) (xr + col));
-                const half2 a = *reinterpret_cast<const half2*>(&u.x);
-                const half2 b = *reinterpret_cast<const half2*>(&u.y);
-                v0 = __low2float(a); v1 = __high2float(a); v2 = __low2float(b); v3 = __high2float(b);
+                const __nv_bfloat16* xr = ((const __nv_bfloat16*) p.x) + xo;
+                if (col + 3 < p.H)
+                {
+                    const uint2 u = *((const uint2*) (xr + col));
+                    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+                    const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+                    v0 = a.x; v1 = a.y; v2 = b.x; v3 = b.y;
+                }
+                else
+                {
+                    if (col + 0 < p.H) v0 = __bfloat162float(xr[col + 0]);
+                    if (col + 1 < p.H) v1 = __bfloat162float(xr[col + 1]);
+                    if (col + 2 < p.H) v2 = __bfloat162float(xr[col + 2]);
+                }
             }
             else
             {
-                if (col + 0 < p.H) v0 = __half2float(xr[col + 0]);
-                if (col + 1 < p.H) v1 = __half2float(xr[col + 1]);
-                if (col + 2 < p.H) v2 = __half2float(xr[col + 2]);
+                const half* xr = p.x + xo;
+                if (col + 3 < p.H)
+                {
+                    const uint2 u = *((const uint2*) (xr + col));
+                    const half2 a = *reinterpret_cast<const half2*>(&u.x);
+                    const half2 b = *reinterpret_cast<const half2*>(&u.y);
+                    v0 = __low2float(a); v1 = __high2float(a); v2 = __low2float(b); v3 = __high2float(b);
+                }
+                else
+                {
+                    if (col + 0 < p.H) v0 = __half2float(xr[col + 0]);
+                    if (col + 1 < p.H) v1 = __half2float(xr[col + 1]);
+                    if (col + 2 < p.H) v2 = __half2float(xr[col + 2]);
+                }
             }
             scale_h4(suh + col, v0, v1, v2, v3);
             had128(v0, v1, v2, v3, lane);
@@ -722,7 +750,7 @@ __device__ __forceinline__ void combine_row(const MoeCoop2Params& p, int ks_b, i
             }
             had128(v0, v1, v2, v3, lane);
             scale_h4(((const half*) p.d_svh[e]) + col, v0, v1, v2, v3);
-            const float w = __half2float(p.rw[s]) * slot_scale(p, s, lane);
+            const float w = slot_rw(p, s) * slot_scale(p, s, lane);
             o0 += w * v0; o1 += w * v1; o2 += w * v2; o3 += w * v3;
         }
     }
@@ -900,7 +928,7 @@ __device__ __forceinline__ void b_unit
             if (lane == 0)
             {
                 us.inv[rr] = 1.0f / sc;                 // exact: a power of two
-                if (p.slot_w) p.slot_w[s] = __half2float(p.rw[s]) * sc;
+                if (p.slot_w) p.slot_w[s] = slot_rw(p, s) * sc;
             }
         }
         __syncthreads();
