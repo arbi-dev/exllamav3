@@ -119,7 +119,11 @@ Coop2Plan coop2_plan(int bsz, int topk, int Hi, int I, int Ho, bool gated, int c
 
 int coop2_cb(bool mcg, bool mul1) { return mcg ? 1 : (mul1 ? 2 : 0); }
 
+at::Tensor g_trace;
+
 }  // namespace
+
+at::Tensor exl3_moe_coop2_trace() { return g_trace.defined() ? g_trace.cpu() : at::Tensor(); }
 
 std::vector<int64_t> exl3_moe_coop2_plan
 (
@@ -223,8 +227,8 @@ void exl3_moe_coop2
     p.act = act;
     p.act_auto = act_auto;
     p.dbg = env_int("EXL3_MOE_COOP2_DBG", 0);
-    p.pfd = env_int("EXL3_MOE_COOP2_PFD", 64);
-    p.pfd_b = env_int("EXL3_MOE_COOP2_PFD_B", 64);
+    p.pfd = env_int("EXL3_MOE_COOP2_PFD", 0);
+    p.pfd_b = env_int("EXL3_MOE_COOP2_PFD_B", 0);
 
     const int K_gu = gated ? Kg : Ku;
     const int cb = coop2_cb(mcg, mul1);
@@ -281,6 +285,11 @@ void exl3_moe_coop2
         const int max_units = p.slots * nproj * p.cg_a * std::max(1, std::min(ca, p.cap_a / p.slots)) +
                               p.slots * p.cg_b * std::max(1, std::min(cbk, p.cap_b / p.slots));
         const int grid = std::min(fill, max_units);
+        if (env_int("EXL3_MOE_COOP2_TRACE", 0))
+        {
+            g_trace = at::zeros({grid, exl3_moe_coop2_ns::TRACE_W}, x.options().dtype(at::kLong));
+            p.trace = (long long*) g_trace.data_ptr();
+        }
         cuda_check(cudaLaunchKernel(kf, dim3(grid), dim3(THREADS), args, SMEM_BYTES, stream));
         return;
     }

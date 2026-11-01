@@ -368,6 +368,27 @@ __device__ __forceinline__ void stage_chunk
     }
 }
 
+// Profiling trace (EXL3_MOE_COOP2_TRACE): per block, TRACE_W int64 slots of globaltimer stamps
+constexpr int TRACE_W = 64;
+__device__ __forceinline__ uint64_t gtimer()
+{
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ void trace_at(const MoeCoop2Params& p, int i, uint64_t v)
+{
+    if (p.trace && threadIdx.x == 0 && i < TRACE_W) p.trace[(size_t) blockIdx.x * TRACE_W + i] = (long long) v;
+}
+
+// L2 prefetch of one weight line, plain (evict_normal): an evict_last line outlives the step and
+// crowds the next layers' working set out of L2. Off by default (EXL3_MOE_COOP2_PFD / _PFD_B): on
+// the 4090 the cp.async rings alone stream faster across a whole step (arbi-serve#3814)
+__device__ __forceinline__ void l2_prefetch(const MoeCoop2Params& p, const void* a)
+{
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(a));
+}
+
 // ---------------------------------------------------------------------------------------------
 // One unit's GEMV: rows x (k chunks [c0, c1)) x (the block's 256-column group). Each warp streams
 // its 32 columns' trellis words through a private cp.async ring (no block barrier per slice);
@@ -415,7 +436,7 @@ __device__ __forceinline__ void unit_gemv
         {
             const int i = i0 + j / LPS;
             const uint32_t* a = pbase + (size_t) i * sstride + (j % LPS) * 32;
-            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(a));
+            l2_prefetch(p, a);
         }
     };
     prefetch(0, min(ns, pfd));
@@ -462,7 +483,7 @@ __device__ __forceinline__ void unit_gemv
             if (pfd > 0 && i + pfd < ns && lane < LPS)
             {
                 const uint32_t* a = pbase + (size_t) (i + pfd) * sstride + lane * 32;
-                asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(a));
+                l2_prefetch(p, a);
             }
             if (!wact || (p.dbg & 1)) continue;
 
@@ -548,6 +569,7 @@ struct UnitShared
     int flag;
     unsigned done;
     int next;
+    uint64_t tw;
 };
 
 template <int bits, int cb>
@@ -833,7 +855,7 @@ __device__ __forceinline__ void write_empty_row(const MoeCoop2Params& p, int row
 }
 // Down unit u of the step (u < run count * cg_b * ks_b). wait_run (fused kernel): the run's
 // activation is published through run_ready, awaited once the unit's weights are in flight
-template <int bits, int cb>
+template <int bits, int cb, bool FUSED>
 __device__ __forceinline__ void b_unit
 (
     const MoeCoop2Params& p, const RunTable& rt, int u, int ks_b, int pfd,
@@ -855,7 +877,7 @@ __device__ __forceinline__ void b_unit
     // Per-row inverse activation scale; after the run's activation is complete
     auto scales = [&] ()
     {
-        if (run_ready)
+        if (FUSED)
         {
             if (threadIdx.x == 0)
             {
@@ -867,6 +889,7 @@ __device__ __forceinline__ void b_unit
                     if (v >= want) break;
                     __nanosleep(64);
                 }
+                if (p.trace) us.tw = gtimer();
             }
             __syncthreads();
         }
@@ -888,13 +911,7 @@ __device__ __forceinline__ void b_unit
     const uint32_t* B32 = (const uint32_t*) p.d_trellis[e];
 
     FragC acc[WNT][2];
-    if (run_ready)
-        unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, us.rows, nrows, nullptr, us.inv, ring, abuf, pfd, acc, scales);
-    else
-    {
-        scales();
-        unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, us.rows, nrows, nullptr, us.inv, ring, abuf, pfd, acc);
-    }
+    unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, us.rows, nrows, nullptr, us.inv, ring, abuf, pfd, acc, scales);
     float* part = p.part_b + (size_t) ks * p.slots * p.Ho;
     store_partials(part, p.Ho, ntiles, group, us.rows, nrows, acc);
 
@@ -919,7 +936,7 @@ __device__ __forceinline__ void b_unit
     if (done)
     {
         __threadfence();
-        if (p.slot_w) combine_rows(p, rt, ks_b, us.rows, nrows, done, group);
+        if (FUSED || p.slot_w) combine_rows(p, rt, ks_b, us.rows, nrows, done, group);
         else
             for (int rr = 0; rr < nrows; ++rr)
                 if (done & (1u << rr))
@@ -949,7 +966,7 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
     const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots);
     const int n_units = rt.n_runs * p.cg_b * ks_b;
     for (int u = blockIdx.x; u < n_units; u += gridDim.x)
-        b_unit<bits, cb>(p, rt, u, ks_b, 0, ring, abuf, us, nullptr);
+        b_unit<bits, cb, false>(p, rt, u, ks_b, 0, ring, abuf, us, nullptr);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -975,6 +992,7 @@ void exl3_moe_coop2_f_kernel(const MoeCoop2Params p)
     int* exits = p.fctr + 1;
     int* run_ready = p.fctr + 2;
 
+    trace_at(p, 0, gtimer());
     if (threadIdx.x == 0) us.next = atomicAdd(ticket, 1);
 
     for (int row = blockIdx.x; row < p.bsz; row += gridDim.x)
@@ -990,16 +1008,30 @@ void exl3_moe_coop2_f_kernel(const MoeCoop2Params p)
     const int pfd_a = (n_a <= (int) gridDim.x && !(p.dbg & 4)) ? p.pfd : 0;
     const int pfd_b = (p.dbg & 4) ? 0 : p.pfd_b;
 
+
     int u = us.next;            // published by build_runs' barriers
+    trace_at(p, 1, gtimer());
+    int nu = 0;
     while (u < n_a + n_b)
     {
         __syncthreads();
-        if (threadIdx.x == 0) us.next = atomicAdd(ticket, 1);
+        if (threadIdx.x == 0) { us.next = atomicAdd(ticket, 1); us.tw = 0; }
+        const uint64_t t0 = gtimer();
         // us.next is read after the unit's own barriers
         if (u < n_a) a_unit<bits, cb>(p, rt, u, ks_a, pfd_a, ring, abuf, us, run_ready);
-        else b_unit<bits, cb>(p, rt, u - n_a, ks_b, pfd_b, ring, abuf, us, run_ready);
+        else b_unit<bits, cb, true>(p, rt, u - n_a, ks_b, pfd_b, ring, abuf, us, run_ready);
+        if (p.trace && threadIdx.x == 0 && nu < 14)
+        {
+            trace_at(p, 4 + nu * 4 + 0, (uint64_t) u);
+            trace_at(p, 4 + nu * 4 + 1, t0);
+            trace_at(p, 4 + nu * 4 + 2, us.tw);
+            trace_at(p, 4 + nu * 4 + 3, gtimer());
+        }
+        ++nu;
         u = us.next;
     }
+    trace_at(p, 2, gtimer());
+    if (threadIdx.x == 0 && p.trace) trace_at(p, 3, (uint64_t) (n_a | (n_b << 16) | ((uint64_t) nu << 32)));
 
     // Last block out: every unit of the call is done; zero the queue and the run flags
     __syncthreads();

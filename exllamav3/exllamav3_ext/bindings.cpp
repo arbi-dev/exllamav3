@@ -265,6 +265,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_coop_scaled", &exl3_moe_coop_scaled, "exl3_moe_coop_scaled");
     m.def("exl3_moe_coop2", &exl3_moe_coop2, "exl3_moe_coop2");
     m.def("exl3_moe_coop2_plan", &exl3_moe_coop2_plan, "exl3_moe_coop2_plan");
+    m.def("exl3_moe_coop2_trace", &exl3_moe_coop2_trace, "exl3_moe_coop2_trace");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");

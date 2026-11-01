@@ -87,6 +87,7 @@ struct MoeCoop2Params
     int pfd;                    // L2 prefetch distance in k slices of a single-wave step's units
     int pfd_b;                  // fused kernel: L2 prefetch distance of a down unit (put in flight before its wait)
     int* fctr;                  // fused kernel: [ticket, exits, run_ready[slots_cap]], zero between calls
+    long long* trace;           // EXL3_MOE_COOP2_TRACE (profiling): per-block globaltimer stamps of the fused kernel
     float* slot_w;              // (slots_cap) routing weight * activation scale per slot (fast combine), nullable
     int dbg;                    // EXL3_MOE_COOP2_DBG (profiling): 1 skip dequant+MMA, 2 skip operand staging,
                                 // 4 no unit L2 prefetch, 8 no evict-first hint, 16 no down combine, 32 no gate/up epilogue, 64 slow combine
@@ -134,6 +135,11 @@ void exl3_moe_coop2
     int ks_a,
     int ks_b
 );
+
+// Profiling: the fused kernel's last traced call, (blocks, 64) int64 globaltimer stamps
+// (EXL3_MOE_COOP2_TRACE=1). [0] start, [1] run table built, [2] exit, [3] n_a | n_b << 16 |
+// units << 32, then per unit: ticket, start, wait done (0: none), end
+at::Tensor exl3_moe_coop2_trace();
 
 // The launch plan of a step: {ks_a, ks_b, grid_a, grid_b}; the k splits are those of a step whose
 // slots pick distinct experts (the kernels pick theirs from the step's actual run count).
