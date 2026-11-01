@@ -268,8 +268,9 @@ void exl3_moe_coop2
 
     // One launch when gate/up and down share a width and the counter scratch holds the fused
     // kernel's queue (EXL3_MOE_COOP2_FUSED=0: the two launches, comparison arm)
-    const bool fused = K_gu == Kd && env_int("EXL3_MOE_COOP2_FUSED", 1) != 0 &&
-                       ctr.numel() >= exl3_moe_coop2_ctr_len(slots_cap, p.I, p.Ho);
+    const bool full_ctr = ctr.numel() >= exl3_moe_coop2_ctr_len(slots_cap, p.I, p.Ho);
+    if (full_ctr && !(p.dbg & 64)) p.slot_w = (float*) (p.ctr_b + p.ctr_b_len + 2 + slots_cap);
+    const bool fused = K_gu == Kd && env_int("EXL3_MOE_COOP2_FUSED", 1) != 0 && full_ctr;
     if (fused)
     {
         void* kf = coop2_kernel_f(K_gu, cb);

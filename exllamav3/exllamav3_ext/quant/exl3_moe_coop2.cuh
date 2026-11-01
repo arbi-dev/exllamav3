@@ -87,12 +87,14 @@ struct MoeCoop2Params
     int pfd;                    // L2 prefetch distance in k slices of a single-wave step's units
     int pfd_b;                  // fused kernel: L2 prefetch distance of a down unit (put in flight before its wait)
     int* fctr;                  // fused kernel: [ticket, exits, run_ready[slots_cap]], zero between calls
+    float* slot_w;              // (slots_cap) routing weight * activation scale per slot (fast combine), nullable
     int dbg;                    // EXL3_MOE_COOP2_DBG (profiling): 1 skip dequant+MMA, 2 skip operand staging,
-                                // 4 no unit L2 prefetch, 8 no evict-first hint
+                                // 4 no unit L2 prefetch, 8 no evict-first hint, 16 no down combine, 32 no gate/up epilogue, 64 slow combine
 };
 
 // Scratch lengths for a geometry (slots_cap = rows_max * top_k <= MOE_COOP2_MAX_SLOTS): the
-// arrival counters of both stages, then the fused kernel's queue and run flags. A counter scratch
+// arrival counters of both stages, then the fused kernel's queue and run flags, then the
+// per-slot combine weights (fp32 bits). A counter scratch
 // of only the two-launch length (exl3_moe_coop2_ctr_len_2l) keeps the two launches
 inline int64_t exl3_moe_coop2_ctr_len_2l(int64_t slots_cap, int64_t I, int64_t Ho)
 {
@@ -102,7 +104,7 @@ inline int64_t exl3_moe_coop2_ctr_len_2l(int64_t slots_cap, int64_t I, int64_t H
 
 inline int64_t exl3_moe_coop2_ctr_len(int64_t slots_cap, int64_t I, int64_t Ho)
 {
-    return exl3_moe_coop2_ctr_len_2l(slots_cap, I, Ho) + 2 + slots_cap;
+    return exl3_moe_coop2_ctr_len_2l(slots_cap, I, Ho) + 2 + 2 * slots_cap;
 }
 
 void exl3_moe_coop2

@@ -187,6 +187,7 @@ struct RunTable
     int16_t r_exp[SMAX];
     int16_t r_first[SMAX];
     int8_t r_n[SMAX];
+    int16_t slot_e[SMAX];       // local expert of each slot, -1 inactive
     int n_runs;
     int scan[NW];
 };
@@ -208,6 +209,7 @@ __device__ __forceinline__ void build_runs(const MoeCoop2Params& p, RunTable& rt
             {
                 const int s = b + lane;
                 const int e = s < slots ? slot_local(p, s) : -1;
+                if (s < slots) rt.slot_e[s] = (int16_t) e;
                 const unsigned m = __ballot_sync(0xffffffffu, e >= 0);
                 if (e >= 0)
                 {
@@ -232,7 +234,11 @@ __device__ __forceinline__ void build_runs(const MoeCoop2Params& p, RunTable& rt
     const int NL = p.n_local;
 
     for (int e = t; e < NL; e += THREADS) cnt[e] = 0;
-    for (int s = t; s < slots; s += THREADS) loc[s] = slot_local(p, s);
+    for (int s = t; s < slots; s += THREADS)
+    {
+        loc[s] = slot_local(p, s);
+        rt.slot_e[s] = (int16_t) loc[s];
+    }
     __syncthreads();
 
     // Stable rank within the expert, one warp over the slots in order
@@ -583,7 +589,7 @@ __device__ __forceinline__ void a_unit
     // Epilogue: (row, 128-chunk) pairs of the group, a warp each
     const int qn = min(GCOLS / KC, p.I / KC - group * (GCOLS / KC));
     const size_t pstride = (size_t) p.slots * p.I;
-    for (int pr = warp; pr < nrows * qn; pr += NW)
+    for (int pr = warp; pr < ((p.dbg & 32) ? 0 : nrows * qn); pr += NW)
     {
         const int rr = pr / qn;
         const int q = group * (GCOLS / KC) + pr % qn;
@@ -731,6 +737,94 @@ __device__ __forceinline__ void combine_row(const MoeCoop2Params& p, int ks_b, i
     __syncthreads();
 }
 
+// Fast combine (slot_w scratch present): a warp per (done row, 128-column chunk) sums the row's
+// slots in slot order, every slot's loads issued before any is used. Slot activity from the run
+// table, the slot's routing weight times its activation scale from slot_w (written by the slot's
+// down units before their arrivals)
+constexpr int CMB_K = 8;        // slots per token held in flight (larger top_k loops)
+
+__device__ __forceinline__ void combine_rows
+(
+    const MoeCoop2Params& p, const RunTable& rt, int ks_b, const int* rows, int nrows, unsigned done, int group
+)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int qn = min(GCOLS / KC, p.Ho / KC - group * (GCOLS / KC));
+    const size_t pstride = (size_t) p.slots * p.Ho;
+    const int nd = __popc(done);
+    for (int it = warp; it < nd * qn; it += NW)
+    {
+        const int row = rows[__fns(done, 0, it / qn + 1)] / p.topk;
+        const int q = group * (GCOLS / KC) + it % qn;
+        const int col = q * KC + lane * 4;
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+        for (int k0 = 0; k0 < p.topk; k0 += CMB_K)
+        {
+            float4 v[CMB_K];
+            uint2 sv[CMB_K];
+            float w[CMB_K];
+            #pragma unroll
+            for (int j = 0; j < CMB_K; ++j)
+            {
+                const int k = k0 + j;
+                const int s = row * p.topk + k;
+                const int e = k < p.topk ? rt.slot_e[s] : -1;
+                v[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                w[j] = 0.0f;
+                if (e >= 0)
+                {
+                    const float* pb = p.part_b + (size_t) s * p.Ho + col;
+                    v[j] = ldcg4(pb);
+                    for (int i = 1; i < ks_b; ++i)
+                    {
+                        const float4 t = ldcg4(pb + i * pstride);
+                        v[j].x += t.x; v[j].y += t.y; v[j].z += t.z; v[j].w += t.w;
+                    }
+                    w[j] = __ldcg(p.slot_w + s);
+                    sv[j] = *((const uint2*) (((const half*) p.d_svh[e]) + col));
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < CMB_K; ++j)
+            {
+                const int k = k0 + j;
+                if (k >= p.topk || rt.slot_e[row * p.topk + k] < 0) continue;
+                float v0 = v[j].x, v1 = v[j].y, v2 = v[j].z, v3 = v[j].w;
+                had128(v0, v1, v2, v3, lane);
+                const half2 a = *reinterpret_cast<const half2*>(&sv[j].x);
+                const half2 b = *reinterpret_cast<const half2*>(&sv[j].y);
+                o0 += w[j] * (v0 * __low2float(a)); o1 += w[j] * (v1 * __high2float(a));
+                o2 += w[j] * (v2 * __low2float(b)); o3 += w[j] * (v3 * __high2float(b));
+            }
+        }
+        if (p.sh_out)
+        {
+            const float* sh = p.sh_out + (size_t) row * p.H + col;
+            if (col + 3 < p.H)
+            {
+                const float4 t = *((const float4*) sh);
+                o0 += t.x; o1 += t.y; o2 += t.z; o3 += t.w;
+            }
+            else
+            {
+                if (col + 0 < p.H) o0 += sh[0];
+                if (col + 1 < p.H) o1 += sh[1];
+                if (col + 2 < p.H) o2 += sh[2];
+            }
+        }
+        count_ovf(p, nonfinite4(o0, o1, o2, o3), lane);
+        float* dst = p.out + (size_t) row * p.out_stride + col;
+        if (col + 3 < p.H_out) *((float4*) dst) = make_float4(o0, o1, o2, o3);
+        else
+        {
+            if (col + 0 < p.H_out) dst[0] = o0;
+            if (col + 1 < p.H_out) dst[1] = o1;
+            if (col + 2 < p.H_out) dst[2] = o2;
+        }
+    }
+}
+
 // A token with no active slot on this rank: its row is the shared term alone, or zeros
 __device__ __forceinline__ void write_empty_row(const MoeCoop2Params& p, int row)
 {
@@ -778,8 +872,13 @@ __device__ __forceinline__ void b_unit
         }
         for (int rr = warp; rr < nrows; rr += NW)
         {
-            const float sc = slot_scale(p, us.rows[rr], lane);
-            if (lane == 0) us.inv[rr] = 1.0f / sc;      // exact: a power of two
+            const int s = us.rows[rr];
+            const float sc = slot_scale(p, s, lane);
+            if (lane == 0)
+            {
+                us.inv[rr] = 1.0f / sc;                 // exact: a power of two
+                if (p.slot_w) p.slot_w[s] = __half2float(p.rw[s]) * sc;
+            }
         }
         __syncthreads();
     };
@@ -806,7 +905,9 @@ __device__ __forceinline__ void b_unit
     if (threadIdx.x < nrows)
     {
         const int row = us.rows[threadIdx.x] / p.topk;
-        const int expected = token_active_slots(p, row) * ks_b;
+        int na = 0;
+        for (int k = 0; k < p.topk; ++k) na += rt.slot_e[row * p.topk + k] >= 0 ? 1 : 0;
+        const int expected = na * ks_b;
         if (atomicAdd(p.ctr_b + row * p.cg_b + group, 1) == expected - 1)
         {
             p.ctr_b[row * p.cg_b + group] = 0;
@@ -814,13 +915,15 @@ __device__ __forceinline__ void b_unit
         }
     }
     __syncthreads();
-    const unsigned done = us.done;
+    const unsigned done = (p.dbg & 16) ? 0u : us.done;
     if (done)
     {
         __threadfence();
-        for (int rr = 0; rr < nrows; ++rr)
-            if (done & (1u << rr))
-                combine_row(p, ks_b, us.rows[rr] / p.topk, group, (float*) ring);
+        if (p.slot_w) combine_rows(p, rt, ks_b, us.rows, nrows, done, group);
+        else
+            for (int rr = 0; rr < nrows; ++rr)
+                if (done & (1u << rr))
+                    combine_row(p, ks_b, us.rows[rr] / p.topk, group, (float*) ring);
     }
     __syncthreads();
 }
