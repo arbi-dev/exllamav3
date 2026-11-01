@@ -279,7 +279,10 @@ void exl3_moe_coop2
     {
         void* kf = coop2_kernel_f(K_gu, cb);
         p.fctr = p.ctr_b + p.ctr_b_len;
-        const int fill_pct = env_int("EXL3_MOE_COOP2_FILL", 100);
+        // 80% of the resident slots: the queue keeps the card's DRAM busy with fewer blocks, and
+        // the rest stay free for the kernels a serving step runs beside the mixture on another
+        // stream (the shared expert under moe_shared_overlap), which a full grid would serialise
+        const int fill_pct = env_int("EXL3_MOE_COOP2_FILL", 80);
         const int fill = std::max(1, DevCtx::instance().get_num_sms(device) * coop2_occupancy(kf, device) * fill_pct / 100);
         const int ca = p.Hi / KC, cbk = p.I / KC;
         const int max_units = p.slots * nproj * p.cg_a * std::max(1, std::min(ca, p.cap_a / p.slots)) +
