@@ -307,6 +307,7 @@ void exl3_moe_coop_run_scaled
     TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1, "exl3_moe_coop: x must be (bsz, H) with unit column stride");
     p.x = (const half*) x.data_ptr();
     p.x_stride = (int) x.stride(0);
+    p.x_bf16 = x.scalar_type() == at::kBFloat16;
     p.bsz = (int) x.size(0);
     p.H = (int) x.size(1);
     p.topk = (int) sel.size(-1);
@@ -363,7 +364,7 @@ static void exl3_moe_coop_impl
     const c10::optional<at::Tensor>& ovf
 )
 {
-    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16, "exl3_moe_coop: x must be fp16 or bf16");
     TORCH_CHECK_DTYPE(sel, kLong);
     TORCH_CHECK(rw.scalar_type() == at::kHalf || rw.scalar_type() == at::kBFloat16, "exl3_moe_coop: rw must be fp16 or bf16");
     TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous(), "exl3_moe_coop: sel/rw must be contiguous");
