@@ -8,9 +8,17 @@ headers once per group instead of once per file. The kernels themselves are
 unchanged: each group #includes the original files verbatim, in order, so every
 kernel is compiled from the same tokens it was before.
 
-WHAT A GROUP MAY HOLD. Only files that include torch headers and whose own device
-work is small. The kernel-instance units under quant/comp_units are already
-torch-free (or are heavy enough to be their own unit) and stay separate.
+WHAT A GROUP MAY HOLD. Only torch-including launcher files that arbi-serve's
+inference never reaches (it serves only LinearEXL3 and the MoE kernels): the
+generator/sampling, DeepSeek-V4, n-gram, GDN and
+attention/norm/rope launchers of exllamav3's own model stack. Merging files
+changes gcc's inlining of host code (a callee shared by more call sites in one
+unit is inlined less), so the files on a serving launch path stay separate,
+their objects unchanged: exl3_gemm/gemv/gemv_int8, hadamard, hgemm*,
+reconstruct, the moe*/coop* launchers, devctx, kernel_map, graph, add,
+softcap, pack, util, moe_handoff. Device code is unaffected either way; every
+kernel's SASS is the same in or out of a group. The kernel-instance units under
+quant/comp_units stay separate as well.
 
 HYGIENE. After each member, every macro that member #defines at file scope is
 #undef'd, so one file's private NUM_THREADS etc. never reaches the next. Two
@@ -33,8 +41,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXT = os.path.dirname(HERE)
 
-# Balanced by measured compile cost (each about one torch header parse plus a few
-# small kernels). Constraints the grouping respects:
+# Balanced by measured compile cost. Constraints the grouping respects:
 #   * two files that include the same header with no include guard
 #     (activation_kernels.cuh, parallel/barrier_inner.cuh) are never grouped;
 #   * gumbel.cu / sampling_basic.cu / sampling_extra.cu each define gumbel();
@@ -44,56 +51,34 @@ EXT = os.path.dirname(HERE)
 #     per-module constant bank whose offsets would shift with the neighbours.
 GROUPS: list[list[str]] = [
     [
+        "activation.cu",
         "gdn.cu",
-        "generator/dry.cu",
-        "hgemm.cu",
+        "generator/gumbel.cu",
         "moe_unswizzle.cu",
         "ngram.cu",
-        "quant/exl3_devctx.cu",
-        "quant/exl3_gemm.cu",
-        "quant/exl3_gemv.cu",
-    ],
-    [
-        "attention.cu",
-        "cpu/moe_handoff.cu",
-        "generator/sampling_extra.cu",
-        "graph.cu",
-        "histogram.cu",
-        "norm.cu",
         "ple.cu",
-        "quant/exl3_gemv_int8.cu",
-        "quant/exl3_kernel_map.cu",
-    ],
-    [
-        "dsa_topk.cu",
-        "generator/cache.cu",
-        "generator/sampling_basic.cu",
-        "generator/sampling_fused.cu",
-        "hc_mix.cu",
-        "quant/exl3_moe.cu",
-        "quant/exl3_moe_coop2.cu",
-        "quant/hadamard.cu",
-        "softcap.cu",
+        "routing.cu",
         "stloader_cu.cu",
     ],
     [
-        "dsv4_compress.cu",
-        "dsv4_pool_quant.cu",
-        "generator/gumbel.cu",
-        "hgemm_f16acc.cu",
-        "quant/coop_autotune.cu",
-        "quant/pack.cu",
-        "quant/util.cu",
+        "attention.cu",
+        "dsa_topk.cu",
+        "generator/rep_pen.cu",
+        "generator/sampling_extra.cu",
+        "hc_mix.cu",
+        "norm.cu",
+        "parallel/context.cu",
         "rope.cu",
     ],
     [
-        "activation.cu",
-        "add.cu",
         "cache/q_cache.cu",
-        "generator/rep_pen.cu",
-        "parallel/context.cu",
-        "quant/exl3_moe_coop.cu",
-        "routing.cu",
+        "dsv4_compress.cu",
+        "dsv4_pool_quant.cu",
+        "generator/cache.cu",
+        "generator/dry.cu",
+        "generator/sampling_basic.cu",
+        "generator/sampling_fused.cu",
+        "histogram.cu",
     ],
 ]
 
