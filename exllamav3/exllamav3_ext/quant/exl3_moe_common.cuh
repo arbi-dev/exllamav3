@@ -60,6 +60,7 @@
                                                 \
     float* __restrict__ output_scratch,         \
     const int64_t* __restrict__ fused_base,     \
+    const int scratch_half,                     \
                                                 \
     const int count_lo,                         \
     const int count_hi

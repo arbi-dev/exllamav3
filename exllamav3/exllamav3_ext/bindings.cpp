@@ -261,6 +261,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+    m.def("exl3_moe_gather_had", &exl3_moe_gather_had, "exl3_moe_gather_had");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
     m.def("exl3_moe_coop_scaled", &exl3_moe_coop_scaled, "exl3_moe_coop_scaled");
     m.def("exl3_moe_coop2", &exl3_moe_coop2, "exl3_moe_coop2");
