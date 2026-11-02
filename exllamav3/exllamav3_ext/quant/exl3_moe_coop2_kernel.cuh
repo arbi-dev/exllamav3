@@ -168,13 +168,18 @@ __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int 
 
 // K segments per unit for a step of u1 (run, projection, group) tiles of `chunks` k chunks on a
 // grid of G blocks: the split that minimises waves * (chunks per unit + a unit's fixed cost of
-// half a chunk), ties to the smaller split. Bounded by the partial-sum capacity. Every block
-// computes the same value from the same run table: a pure function of the routing
-__host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int cap)
+// half a chunk), ties to the smaller split. Bounded by the partial-sum capacity, and from below
+// by max_chunks (0: none), the deepest unit: a down unit waits for its run's activation, and a
+// deep one that starts late is the step's tail (Nemotron's 15-chunk down units, 1 split at 3
+// rows: 139 us/layer on a 4090; at most 5 chunks a unit: 128). Every block computes the same
+// value from the same run table: a pure function of the routing
+__host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int cap, int max_chunks = 0)
 {
     const int hi = chunks < cap ? chunks : cap;
-    int best = 1, best_cost = 0x7fffffff;
-    for (int ks = 1; ks <= hi; ++ks)
+    int lo = max_chunks > 0 ? (chunks + max_chunks - 1) / max_chunks : 1;
+    lo = lo < 1 ? 1 : (lo > hi ? hi : lo);
+    int best = lo, best_cost = 0x7fffffff;
+    for (int ks = lo; ks <= hi; ++ks)
     {
         const int per = (chunks + ks - 1) / ks;
         const int waves = (u1 * ks + G - 1) / G;
@@ -993,7 +998,7 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
 
     build_runs(p, rt, ring);
 
-    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots);
+    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots, p.maxc_b);
     const int n_units = rt.n_runs * p.cg_b * ks_b;
     for (int u = blockIdx.x; u < n_units; u += gridDim.x)
         b_unit<bits, cb, false>(p, rt, u, ks_b, 0, ring, abuf, us, nullptr);
@@ -1032,7 +1037,7 @@ void exl3_moe_coop2_f_kernel(const MoeCoop2Params p)
 
     const int nproj = p.gated ? 2 : 1;
     const int ks_a = p.ks_a > 0 ? p.ks_a : pick_ks(rt.n_runs * nproj * p.cg_a, p.Hi / KC, gridDim.x, p.cap_a / p.slots);
-    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots);
+    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots, p.maxc_b);
     const int n_a = rt.n_runs * nproj * p.cg_a * ks_a;
     const int n_b = rt.n_runs * p.cg_b * ks_b;
     const int pfd_a = (n_a <= (int) gridDim.x && !(p.dbg & 4)) ? p.pfd : 0;
