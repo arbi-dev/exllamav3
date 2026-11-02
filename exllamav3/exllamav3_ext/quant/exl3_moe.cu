@@ -9,6 +9,7 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "comp_units/exl3_moe_instances.cuh"
 #include "exl3_devctx.cuh"
+#include "hadamard_inner.cuh"
 #include <set>
 
 int exl3_moe_max_concurrency(int device)
