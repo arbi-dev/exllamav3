@@ -19,14 +19,13 @@ constexpr int NW = 8;                           // warps per block
 constexpr int THREADS = NW * 32;
 constexpr int WNT = 2;                          // 16-column tiles per warp
 constexpr int GCOLS = NW * WNT * 16;            // columns per group
-constexpr int RMAX = 16;                        // rows of one m16n8k16 MMA
-constexpr int RUNMAX = 2 * RMAX;                // slots per run: two MMAs share each decoded weight fragment
+constexpr int RMAX = 16;                        // slots per run (MMA rows)
 constexpr int KC = 128;                         // k chunk: one Hadamard block
 constexpr int SPC = KC / 16;                    // k slices per chunk
 constexpr int AST = KC + 8;                     // staged operand row stride (halves), bank-padded
 constexpr int SMAX = MOE_COOP2_MAX_SLOTS;
 constexpr int EMAX = MOE_COOP2_MAX_EXPERTS;
-constexpr int RING_BYTES = 3072;                // weight ring per warp (well past what DRAM needs in flight per SM)
+constexpr int RING_BYTES = 4096;                // weight ring per warp
 constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
 
 static_assert(GCOLS == MOE_COOP2_GROUP_COLS, "group width mismatch");
@@ -41,7 +40,7 @@ constexpr int RING_WORDS = RING_BYTES / 4;
 // Dynamic shared memory: weight rings, two staged operand chunks. The run-table build borrows
 // the rings before the first unit
 constexpr int SMEM_RING = NW * RING_BYTES;
-constexpr int SMEM_ABUF = 2 * RUNMAX * AST * 2;
+constexpr int SMEM_ABUF = 2 * RMAX * AST * 2;
 constexpr int SMEM_BYTES = SMEM_RING + SMEM_ABUF;
 static_assert(SMEM_RING >= SMAX * 4 + 3 * (EMAX + 1) * 2 + 64, "run-table scratch exceeds the rings");
 static_assert(SMEM_RING >= NW * 128 * 4, "combine scratch exceeds the rings");
@@ -190,7 +189,7 @@ __host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int c
 }
 
 // ---------------------------------------------------------------------------------------------
-// Run table: active slots sorted stably by (local expert, slot), cut into runs of at most RUNMAX
+// Run table: active slots sorted stably by (local expert, slot), cut into runs of at most RMAX
 // slots of one expert. Every block builds the same table from the routing. Persistent arrays
 // (static shared): order (slot of each sorted position), per run: expert, first sorted position,
 // slot count. Scratch in the (still idle) weight rings
@@ -276,7 +275,7 @@ __device__ __forceinline__ void build_runs(const MoeCoop2Params& p, RunTable& rt
     }
     __syncthreads();
 
-    // Exclusive scans over experts of slot counts and run counts (ceil(cnt / RUNMAX))
+    // Exclusive scans over experts of slot counts and run counts (ceil(cnt / RMAX))
     const int per = (NL + THREADS - 1) / THREADS;
     const int e0 = t * per;
     int ls = 0, lr = 0;
@@ -284,7 +283,7 @@ __device__ __forceinline__ void build_runs(const MoeCoop2Params& p, RunTable& rt
         if (e0 + i < NL)
         {
             ls += cnt[e0 + i];
-            lr += (cnt[e0 + i] + RUNMAX - 1) / RUNMAX;
+            lr += (cnt[e0 + i] + RMAX - 1) / RMAX;
         }
     // pack (slots, runs) into one int: both <= 512
     int v = ls | (lr << 16);
@@ -311,7 +310,7 @@ __device__ __forceinline__ void build_runs(const MoeCoop2Params& p, RunTable& rt
             sbase[e0 + i] = (int16_t) cs;
             rbase[e0 + i] = (int16_t) cr;
             cs += c;
-            cr += (c + RUNMAX - 1) / RUNMAX;
+            cr += (c + RMAX - 1) / RMAX;
         }
     if (t == 0) rt.n_runs = total >> 16;
     __syncthreads();
@@ -324,12 +323,12 @@ __device__ __forceinline__ void build_runs(const MoeCoop2Params& p, RunTable& rt
     for (int e = t; e < NL; e += THREADS)
     {
         const int c = cnt[e];
-        for (int j = 0; j * RUNMAX < c; ++j)
+        for (int j = 0; j * RMAX < c; ++j)
         {
             const int r = rbase[e] + j;
             rt.r_exp[r] = (int16_t) e;
-            rt.r_first[r] = (int16_t) (sbase[e] + j * RUNMAX);
-            rt.r_n[r] = (int8_t) min(RUNMAX, c - j * RUNMAX);
+            rt.r_first[r] = (int16_t) (sbase[e] + j * RMAX);
+            rt.r_n[r] = (int8_t) min(RMAX, c - j * RMAX);
         }
     }
     __syncthreads();
@@ -445,7 +444,6 @@ __device__ __forceinline__ void unit_gemv
     uint32_t* ring, half* abuf,
     int pfd,                    // L2 prefetch distance in slices, 0 = none
     FragC (&acc)[WNT][2],
-    FragC (&acc2)[WNT][2],      // rows 16..31 of a run of more than 16 rows
     const Wait& wait = Wait()   // block-wide: runs after the weight ring is in flight, before the operand is read
 )
 {
@@ -497,8 +495,7 @@ __device__ __forceinline__ void unit_gemv
         #pragma unroll
         for (int f = 0; f < 2; ++f)
             #pragma unroll
-            for (int j = 0; j < 4; ++j) { acc[t][f][j] = 0.0f; acc2[t][f][j] = 0.0f; }
-    const bool two = nrows > RMAX;      // block-uniform
+            for (int j = 0; j < 4; ++j) acc[t][f][j] = 0.0f;
 
     stage_chunk<IS_B>(p, c0, abuf, rows, nrows, suh, inv);
     __syncthreads();
@@ -507,8 +504,8 @@ __device__ __forceinline__ void unit_gemv
     const int kq = 2 * (lane & 3);
     for (int c = c0; c < c1; ++c)
     {
-        const half* ab = abuf + ((c - c0) & 1) * (RUNMAX * AST);
-        if (c + 1 < c1) stage_chunk<IS_B>(p, c + 1, abuf + ((c - c0 + 1) & 1) * (RUNMAX * AST), rows, nrows, suh, inv);
+        const half* ab = abuf + ((c - c0) & 1) * (RMAX * AST);
+        if (c + 1 < c1) stage_chunk<IS_B>(p, c + 1, abuf + ((c - c0 + 1) & 1) * (RMAX * AST), rows, nrows, suh, inv);
 
         #pragma unroll
         for (int j = 0; j < SPC; ++j)
@@ -530,15 +527,6 @@ __device__ __forceinline__ void unit_gemv
             a23[0] = *((const half2*) (ab + g * AST + j * 16 + 8 + kq));
             a23[1] = *((const half2*) (ab + (g + 8) * AST + j * 16 + 8 + kq));
 
-            FragB b01, b23;
-            if (two)
-            {
-                b01[0] = *((const half2*) (ab + (g + 16) * AST + j * 16 + kq));
-                b01[1] = *((const half2*) (ab + (g + 24) * AST + j * 16 + kq));
-                b23[0] = *((const half2*) (ab + (g + 16) * AST + j * 16 + 8 + kq));
-                b23[1] = *((const half2*) (ab + (g + 24) * AST + j * 16 + 8 + kq));
-            }
-
             const uint32_t* sl = wring + (i % D) * SW;
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
@@ -547,11 +535,6 @@ __device__ __forceinline__ void unit_gemv
                 dq_dispatch<bits, cb>(sl + t * 8 * bits, lane << 3, f0, f1);
                 mma_f32(a01, a23, f0, acc[t][0]);
                 mma_f32(a01, a23, f1, acc[t][1]);
-                if (two)
-                {
-                    mma_f32(b01, b23, f0, acc2[t][0]);
-                    mma_f32(b01, b23, f1, acc2[t][1]);
-                }
             }
         }
         __syncthreads();
@@ -562,8 +545,7 @@ __device__ __forceinline__ void unit_gemv
 // Partial sums of a unit: lane holds rows g, g + 8 and two adjacent columns per (tile, frag)
 __device__ __forceinline__ void store_partials
 (
-    float* part, int width, int ntiles, int group, const int* rows, int nrows, FragC (&acc)[WNT][2],
-    FragC (&acc2)[WNT][2]
+    float* part, int width, int ntiles, int group, const int* rows, int nrows, FragC (&acc)[WNT][2]
 )
 {
     const int warp = threadIdx.x / 32;
@@ -573,8 +555,6 @@ __device__ __forceinline__ void store_partials
     const int g = lane >> 2;
     const int r0 = g < nrows ? rows[g] : -1;
     const int r1 = g + 8 < nrows ? rows[g + 8] : -1;
-    const int r2 = g + 16 < nrows ? rows[g + 16] : -1;
-    const int r3 = g + 24 < nrows ? rows[g + 24] : -1;
     #pragma unroll
     for (int t = 0; t < WNT; ++t)
         #pragma unroll
@@ -583,8 +563,6 @@ __device__ __forceinline__ void store_partials
             const int col = (tile0 + t) * 16 + f * 8 + 2 * (lane & 3);
             if (r0 >= 0) *((float2*) (part + (size_t) r0 * width + col)) = make_float2(acc[t][f][0], acc[t][f][1]);
             if (r1 >= 0) *((float2*) (part + (size_t) r1 * width + col)) = make_float2(acc[t][f][2], acc[t][f][3]);
-            if (r2 >= 0) *((float2*) (part + (size_t) r2 * width + col)) = make_float2(acc2[t][f][0], acc2[t][f][1]);
-            if (r3 >= 0) *((float2*) (part + (size_t) r3 * width + col)) = make_float2(acc2[t][f][2], acc2[t][f][3]);
         }
 }
 
@@ -620,8 +598,8 @@ __device__ __forceinline__ void load_run(const RunTable& rt, int run, int* rows,
 
 struct UnitShared
 {
-    int rows[RUNMAX];
-    float inv[RUNMAX];
+    int rows[RMAX];
+    float inv[RMAX];
     int flag;
     unsigned done;
     int next;
@@ -657,10 +635,10 @@ __device__ __forceinline__ void a_unit
     const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[e];
     const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[e];
 
-    FragC acc[WNT][2], acc2[WNT][2];
-    unit_gemv<bits, cb, false>(p, B32, ntiles, group, c0, c1, us.rows, nrows, suh, nullptr, ring, abuf, pfd, acc, acc2);
+    FragC acc[WNT][2];
+    unit_gemv<bits, cb, false>(p, B32, ntiles, group, c0, c1, us.rows, nrows, suh, nullptr, ring, abuf, pfd, acc);
     float* part = p.part_a + (size_t) (proj * ks_a + ks) * p.slots * p.I;
-    store_partials(part, p.I, ntiles, group, us.rows, nrows, acc, acc2);
+    store_partials(part, p.I, ntiles, group, us.rows, nrows, acc);
 
     if (!arrive_last(p.ctr_a + run * p.cg_a + group, nproj * ks_a, &us.flag)) return;
 
@@ -966,10 +944,10 @@ __device__ __forceinline__ void b_unit
     const int c1 = chunks * (ks + 1) / ks_b;
     const uint32_t* B32 = (const uint32_t*) p.d_trellis[e];
 
-    FragC acc[WNT][2], acc2[WNT][2];
-    unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, us.rows, nrows, nullptr, us.inv, ring, abuf, pfd, acc, acc2, scales);
+    FragC acc[WNT][2];
+    unit_gemv<bits, cb, true>(p, B32, ntiles, group, c0, c1, us.rows, nrows, nullptr, us.inv, ring, abuf, pfd, acc, scales);
     float* part = p.part_b + (size_t) ks * p.slots * p.Ho;
-    store_partials(part, p.Ho, ntiles, group, us.rows, nrows, acc, acc2);
+    store_partials(part, p.Ho, ntiles, group, us.rows, nrows, acc);
 
     // One arrival per (token row, group) for each of the run's slots (distinct rows)
     __threadfence();
