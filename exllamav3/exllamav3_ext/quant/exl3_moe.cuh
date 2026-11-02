@@ -61,3 +61,13 @@ void exl3_moe_gather
     const at::Tensor& slot_kind,
     const at::Tensor& weight_sorted
 );
+
+void exl3_moe_gather_had
+(
+    at::Tensor output_state,
+    const at::Tensor& output_scratch,
+    const at::Tensor& flat_expert,
+    const at::Tensor& inv_order,
+    const at::Tensor& weight_sorted,
+    const at::Tensor& down_ptrs_svh
+);

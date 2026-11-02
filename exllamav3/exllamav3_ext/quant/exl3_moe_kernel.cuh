@@ -228,6 +228,16 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             gemm(in_addr, out_addr, trellis, K, intermediate_dim, hidden_dim);
         };
 
+        // fp16 slot scratch: the down GEMM's rows land in the expert's slots directly (the GEMM
+        // stores only the rows it owns, so a tile never writes past the expert's last slot) and
+        // the rotation, svh and routing weight move to exl3_moe_gather_had. No output pass here
+        if (output_scratch && scratch_half)
+        {
+            half* slot_out = ((half*) output_scratch) + fused_base[expert_idx] * (int64_t) hidden_dim;
+            gemm_down(temp_intermediate_g, slot_out, exp_down_trellis, K_down);
+        }
+        else
+        {
         gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
@@ -276,6 +286,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         had_d_out();
+        }
 
         // Draw the next ticket and publish it to the group through the end-of-expert barrier, which also protects
         // the temp buffers for reuse. Grabbed tickets continue from num_groups since 0..num_groups-1 are implicit

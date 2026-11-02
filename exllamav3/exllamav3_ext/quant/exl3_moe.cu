@@ -191,10 +191,17 @@ void exl3_moe
     if (num_active == 0) return;
     void* _output_scratch = nullptr;
     void* _fused_base = nullptr;
+    int scratch_half = 0;
     if (output_scratch.has_value())
     {
         TORCH_CHECK(fused_base.has_value(), "exl3_moe: output_scratch needs fused_base");
-        TORCH_CHECK_DTYPE(output_scratch.value(), kFloat);
+        // fp32: the kernel stores each assignment's weighted, Hadamard-rotated output (summed by
+        // exl3_moe_gather). fp16: the down GEMM writes its raw output straight into the slot and
+        // exl3_moe_gather_had applies the rotation, svh and weight while it sums
+        TORCH_CHECK(output_scratch.value().scalar_type() == at::kFloat ||
+                    output_scratch.value().scalar_type() == at::kHalf,
+                    "exl3_moe: output_scratch must be float32 or float16");
+        scratch_half = output_scratch.value().scalar_type() == at::kHalf ? 1 : 0;
         TORCH_CHECK_DTYPE(fused_base.value(), kLong);
         TORCH_CHECK(output_scratch.value().is_contiguous() && output_scratch.value().dim() == 2 &&
                     output_scratch.value().size(1) == hidden_state.size(1), "exl3_moe: output_scratch must be [slots, hidden]");
@@ -361,6 +368,7 @@ void exl3_moe
         (void*) &locks,
         &_output_scratch,
         &_fused_base,
+        (void*) &scratch_half,
         (void*) &count_lo,
         (void*) &count_hi
     };
@@ -498,6 +506,138 @@ void exl3_moe_gather
         (const int64_t*) slot_base.data_ptr(),
         (const int64_t*) slot_kind.data_ptr(),
         (const half*) weight_sorted.data_ptr(),
+        hidden_dim, topk, num_experts
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// The fp16 slot scratch's reduction (exl3_moe with a half output_scratch). Slot p holds the raw
+// down-GEMM row of the assignment at sorted position p (fused_base == expert_start, so the slot of
+// assignment a is inv_order[a]). Per token and 128-column chunk, one warp applies exactly the
+// per-assignment math had_hf_r_128_d_inner does in the atomic path (128-wide Hadamard in fp32,
+// r_scale * weight, then the expert's svh) and sums the token's assignments in k order, then stores
+// the row. Same values as the atomic combine up to summation order, and the order is fixed.
+// Assignments to the sentinel bin (expert id outside [0, num_experts)) contribute nothing
+#define MOE_GATHER_HAD_WARPS 8
+
+__global__ __launch_bounds__(32 * MOE_GATHER_HAD_WARPS)
+void exl3_moe_gather_had_kernel
+(
+    float* __restrict__ output_state,
+    const half* __restrict__ output_scratch,
+    const int64_t* __restrict__ flat_expert,
+    const int64_t* __restrict__ inv_order,
+    const half* __restrict__ weight_sorted,
+    const half** __restrict__ down_svh,
+    const int hidden_dim,
+    const int topk,
+    const int num_experts
+)
+{
+    const int token = blockIdx.x;
+    const int t = threadIdx.x & 31;
+    const int chunk = blockIdx.y * MOE_GATHER_HAD_WARPS + threadIdx.x / 32;
+    if (chunk * 128 >= hidden_dim) return;
+
+    // Lane k < topk resolves assignment k once; the k loop broadcasts it
+    int64_t my_slot = -1;
+    int64_t my_e = -1;
+    float my_scale = 0.0f;
+    if (t < topk)
+    {
+        int64_t a = (int64_t) token * topk + t;
+        int64_t e = flat_expert[a];
+        if (e >= 0 && e < num_experts)
+        {
+            int64_t pos = inv_order[a];
+            my_slot = pos;
+            my_e = e;
+            my_scale = 0.088388347648f * __half2float(weight_sorted[pos]);
+        }
+    }
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int k = 0; k < topk; ++k)
+    {
+        int64_t slot = __shfl_sync(0xffffffff, my_slot, k);
+        if (slot < 0) continue;
+        int64_t e = __shfl_sync(0xffffffff, my_e, k);
+        float r_scale = __shfl_sync(0xffffffff, my_scale, k);
+
+        half4 v = ((const half4*) (output_scratch + slot * hidden_dim + chunk * 128))[t];
+        float v0 = __half2float(__low2half(v.x));
+        float v1 = __half2float(__high2half(v.x));
+        float v2 = __half2float(__low2half(v.y));
+        float v3 = __half2float(__high2half(v.y));
+        float s0 = v0 + v1;
+        float d0 = v0 - v1;
+        float s1 = v2 + v3;
+        float d1 = v2 - v3;
+        float h0 = s0 + s1;
+        float h1 = d0 + d1;
+        float h2 = s0 - s1;
+        float h3 = d0 - d1;
+        shuffle_had_f4x32(h0, h1, h2, h3, t);
+        h0 *= r_scale;
+        h1 *= r_scale;
+        h2 *= r_scale;
+        h3 *= r_scale;
+        half4 sc = ((const half4*) (down_svh[e] + chunk * 128))[t];
+        h0 *= __low2float(sc.x);
+        h1 *= __high2float(sc.x);
+        h2 *= __low2float(sc.y);
+        h3 *= __high2float(sc.y);
+        a0 += h0;
+        a1 += h1;
+        a2 += h2;
+        a3 += h3;
+    }
+    // Lane t holds columns 4t..4t+3 of the chunk (the layout had_hf_r_128_d_inner reshuffles to)
+    ((float4*) (output_state + (int64_t) token * hidden_dim + chunk * 128))[t] = make_float4(a0, a1, a2, a3);
+}
+
+void exl3_moe_gather_had
+(
+    at::Tensor output_state,
+    const at::Tensor& output_scratch,
+    const at::Tensor& flat_expert,
+    const at::Tensor& inv_order,
+    const at::Tensor& weight_sorted,
+    const at::Tensor& down_ptrs_svh
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(output_state.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(output_state, kFloat);
+    TORCH_CHECK_DTYPE(output_scratch, kHalf);
+    TORCH_CHECK_DTYPE(flat_expert, kLong);
+    TORCH_CHECK_DTYPE(inv_order, kLong);
+    TORCH_CHECK_DTYPE(weight_sorted, kHalf);
+    TORCH_CHECK_DTYPE(down_ptrs_svh, kLong);
+    TORCH_CHECK(output_state.is_contiguous() && output_state.dim() == 2, "exl3_moe_gather_had: output_state");
+    TORCH_CHECK(output_scratch.is_contiguous() && output_scratch.dim() == 2 && output_scratch.size(1) == output_state.size(1),
+                "exl3_moe_gather_had: output_scratch must be [slots, hidden]");
+    TORCH_CHECK(flat_expert.is_contiguous() && inv_order.is_contiguous() && weight_sorted.is_contiguous() &&
+                down_ptrs_svh.is_contiguous(), "exl3_moe_gather_had: index tensors must be contiguous");
+    int tokens = output_state.size(0);
+    int hidden_dim = output_state.size(1);
+    TORCH_CHECK(hidden_dim % 128 == 0, "exl3_moe_gather_had: hidden_dim must be a multiple of 128");
+    if (!tokens) return;
+    int num_assign = flat_expert.size(0);
+    TORCH_CHECK(num_assign % tokens == 0, "exl3_moe_gather_had: assignments / tokens");
+    int topk = num_assign / tokens;
+    TORCH_CHECK(topk <= 32, "exl3_moe_gather_had: top-k must fit one warp");
+    int num_experts = down_ptrs_svh.size(0);
+    dim3 grid(tokens, CEIL_DIVIDE(hidden_dim / 128, MOE_GATHER_HAD_WARPS));
+    exl3_moe_gather_had_kernel<<<grid, 32 * MOE_GATHER_HAD_WARPS, 0, stream>>>
+    (
+        (float*) output_state.data_ptr(),
+        (const half*) output_scratch.data_ptr(),
+        (const int64_t*) flat_expert.data_ptr(),
+        (const int64_t*) inv_order.data_ptr(),
+        (const half*) weight_sorted.data_ptr(),
+        (const half**) down_ptrs_svh.data_ptr(),
         hidden_dim, topk, num_experts
     );
     cuda_check(cudaPeekAtLastError());
