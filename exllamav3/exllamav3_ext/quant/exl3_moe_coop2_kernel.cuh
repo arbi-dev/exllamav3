@@ -170,9 +170,8 @@ __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int 
 // grid of G blocks: the split that minimises waves * (chunks per unit + a unit's fixed cost of
 // half a chunk), ties to the smaller split. Bounded by the partial-sum capacity, and from below
 // by max_chunks (0: none), the deepest unit: a down unit waits for its run's activation, and a
-// deep one that starts late is the step's tail (Nemotron's 15-chunk down units, 1 split at 3
-// rows: 139 us/layer on a 4090; at most 5 chunks a unit: 128). Every block computes the same
-// value from the same run table: a pure function of the routing
+// deep one that starts late is the step's tail, which the wave count does not see. Every block
+// computes the same value from the same run table: a pure function of the routing
 __host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int cap, int max_chunks = 0)
 {
     const int hi = chunks < cap ? chunks : cap;
