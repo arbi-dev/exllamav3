@@ -32,6 +32,7 @@
 #include "quant/exl3_moe.cuh"
 #include "quant/exl3_moe_coop.cuh"
 #include "quant/exl3_moe_coop2.cuh"
+#include "quant/exl3_moe_ws.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -268,6 +269,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_coop_caps", &exl3_moe_coop_caps, "exl3_moe_coop_caps");
     m.def("exl3_moe_coop2_plan", &exl3_moe_coop2_plan, "exl3_moe_coop2_plan");
     m.def("exl3_moe_coop2_trace", &exl3_moe_coop2_trace, "exl3_moe_coop2_trace");
+    m.def("exl3_moe_coop2_ws", &exl3_moe_coop2_ws, "exl3_moe_coop2_ws");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
