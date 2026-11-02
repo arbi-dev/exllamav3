@@ -82,6 +82,7 @@ struct MoeCoop2Params
     int ks_a;                   // k segments per gate/up unit; 0: the kernels pick per step (pick_ks)
     int ks_b;                   // k segments per down unit; 0: the kernels pick per step
     int maxc_b;                 // deepest down unit the kernels' pick leaves, in 128-k chunks (0: no bound)
+    int64_t pf_down_bytes;      // fused kernel: the gate/up units pull the step's down weights into L2 when they fit this (0: never)
     int cap_a;                  // part_a capacity in (k segment, slot) rows per projection: ks_a * slots <= cap_a
     int cap_b;                  // part_b capacity in (k segment, slot) rows: ks_b * slots <= cap_b
     bool act_auto;

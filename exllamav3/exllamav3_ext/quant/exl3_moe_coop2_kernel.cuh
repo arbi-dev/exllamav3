@@ -170,9 +170,8 @@ __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int 
 // grid of G blocks: the split that minimises waves * (chunks per unit + a unit's fixed cost of
 // half a chunk), ties to the smaller split. Bounded by the partial-sum capacity, and from below
 // by max_chunks (0: none), the deepest unit: a down unit waits for its run's activation, and a
-// deep one that starts late is the step's tail (Nemotron's 15-chunk down units, 1 split at 3
-// rows: 139 us/layer on a 4090; at most 5 chunks a unit: 128). Every block computes the same
-// value from the same run table: a pure function of the routing
+// deep one that starts late is the step's tail, which the wave count does not see. Every block
+// computes the same value from the same run table: a pure function of the routing
 __host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int cap, int max_chunks = 0)
 {
     const int hi = chunks < cap ? chunks : cap;
@@ -611,7 +610,7 @@ template <int bits, int cb>
 __device__ __forceinline__ void a_unit
 (
     const MoeCoop2Params& p, const RunTable& rt, int u, int ks_a, int pfd,
-    uint32_t* ring, half* abuf, UnitShared& us, int* run_ready
+    uint32_t* ring, half* abuf, UnitShared& us, int* run_ready, bool pf_down = false
 )
 {
     const int warp = threadIdx.x / 32;
@@ -635,6 +634,19 @@ __device__ __forceinline__ void a_unit
     const int c1 = chunks * (ks + 1) / ks_a;
     const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[e];
     const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[e];
+
+    // Down weights to L2 (fused kernel, when the step's down weights fit): this unit's share of
+    // its run's expert, so they stream from DRAM beside the gate/up phase instead of after it
+    if (pf_down)
+    {
+        const size_t bytes = (size_t) p.I * p.Ho * bits / 8;
+        const int n = nproj * p.cg_a * ks_a;
+        const int idx = (proj * p.cg_a + group) * ks_a + ks;
+        const size_t lo = (bytes * idx / n) & ~(size_t) 127;
+        const size_t hi = idx == n - 1 ? bytes : ((bytes * (idx + 1) / n) & ~(size_t) 127);
+        const char* d = (const char*) p.d_trellis[e];
+        for (size_t o = lo + (size_t) threadIdx.x * 128; o < hi; o += (size_t) THREADS * 128) l2_prefetch(p, d + o);
+    }
 
     FragC acc[WNT][2];
     unit_gemv<bits, cb, false>(p, B32, ntiles, group, c0, c1, us.rows, nrows, suh, nullptr, ring, abuf, pfd, acc);
@@ -1042,6 +1054,8 @@ void exl3_moe_coop2_f_kernel(const MoeCoop2Params p)
     const int n_b = rt.n_runs * p.cg_b * ks_b;
     const int pfd_a = (n_a <= (int) gridDim.x && !(p.dbg & 4)) ? p.pfd : 0;
     const int pfd_b = (p.dbg & 4) ? 0 : p.pfd_b;
+    // The step's down weights fit the L2 budget: the gate/up units pull them in (a_unit)
+    const bool pf_down = (int64_t) rt.n_runs * ((int64_t) p.I * p.Ho * bits / 8) <= p.pf_down_bytes;
 
 
     int u = us.next;            // published by build_runs' barriers
@@ -1053,7 +1067,7 @@ void exl3_moe_coop2_f_kernel(const MoeCoop2Params p)
         if (threadIdx.x == 0) { us.next = atomicAdd(ticket, 1); us.tw = 0; }
         const uint64_t t0 = gtimer();
         // us.next is read after the unit's own barriers
-        if (u < n_a) a_unit<bits, cb>(p, rt, u, ks_a, pfd_a, ring, abuf, us, run_ready);
+        if (u < n_a) a_unit<bits, cb>(p, rt, u, ks_a, pfd_a, ring, abuf, us, run_ready, pf_down);
         else b_unit<bits, cb, true>(p, rt, u - n_a, ks_b, pfd_b, ring, abuf, us, run_ready);
         if (p.trace && threadIdx.x == 0 && nu < 14)
         {
