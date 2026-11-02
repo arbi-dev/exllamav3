@@ -286,13 +286,6 @@ void exl3_moe_coop2
     {
         void* kf = coop2_kernel_f(K_gu, cb);
         p.fctr = p.ctr_b + p.ctr_b_len;
-        // Half the L2 by default (EXL3_MOE_COOP2_PF_DOWN_L2PCT): the gate/up weights stream through
-        // the other half meanwhile
-        {
-            int l2 = 0;
-            cuda_check(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device));
-            p.pf_down_bytes = (int64_t) l2 * env_int("EXL3_MOE_COOP2_PF_DOWN_L2PCT", 50) / 100;
-        }
         // 80% of the resident slots: the queue keeps the card's DRAM busy with fewer blocks, and
         // the rest stay free for the kernels a serving step runs beside the mixture on another
         // stream (the shared expert under moe_shared_overlap), which a full grid would serialise
