@@ -149,9 +149,11 @@ __device__ __forceinline__ int token_active_slots(const MoeCoop2Params& p, int r
     return n;
 }
 
-// Power-of-two scale bringing a slot's activation peak to at most MOE_COOP2_ACT_AUTO_PEAK
-// (1 when it already fits). Pure function of the slot's chunk peaks: kernel B's staging and its
-// combine compute the same value
+// Power-of-two scale bringing a slot's activation peak into (MOE_COOP2_ACT_AUTO_PEAK / 2,
+// MOE_COOP2_ACT_AUTO_PEAK]: down for a large activation (fp16 range), UP for a small one, whose fp16
+// operand would otherwise sit in the low exponents and lose precision (a 1e-3 activation gave the
+// down stage 1e-1 relative error). Exact either way. Pure function of the slot's chunk peaks:
+// kernel B's staging and its combine compute the same value
 __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int lane)
 {
     if (!p.act_auto) return 1.0f;
@@ -160,8 +162,8 @@ __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int 
     for (int c = lane; c < nc; c += 32) m = fmaxf(m, __ldcg(p.peak + (size_t) s * nc + c));
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    if (!(m <= 3.0e38f)) return 1.0f;   // non-finite: counted by kernel A, nothing to rescue
-    return m > MOE_COOP2_ACT_AUTO_PEAK ? exp2f(ceilf(log2f(m / MOE_COOP2_ACT_AUTO_PEAK))) : 1.0f;
+    if (!(m <= 3.0e38f) || m == 0.0f) return 1.0f;   // non-finite (counted by kernel A) or all zero
+    return exp2f(fmaxf(ceilf(log2f(m / MOE_COOP2_ACT_AUTO_PEAK)), -96.0f));
 }
 
 // K segments per unit for a step of u1 (run, projection, group) tiles of `chunks` k chunks on a
