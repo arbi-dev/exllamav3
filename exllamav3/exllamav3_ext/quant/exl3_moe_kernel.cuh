@@ -230,15 +230,16 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 
         // fp16 slot scratch: the down GEMM's rows land in the expert's slots directly (the GEMM
         // stores only the rows it owns, so a tile never writes past the expert's last slot) and
-        // the rotation, svh and routing weight move to exl3_moe_gather_had. No output pass here
-        if (output_scratch && scratch_half)
+        // the rotation, svh and routing weight move to exl3_moe_gather_had, so there is no output
+        // pass here. One GEMM call site either way: the GEMM is inlined, and a second copy costs
+        // the whole kernel registers
+        const bool slot_half = output_scratch && scratch_half;
+        half* down_out = slot_half
+            ? ((half*) output_scratch) + fused_base[expert_idx] * (int64_t) hidden_dim
+            : temp_state_g;
+        gemm_down(temp_intermediate_g, down_out, exp_down_trellis, K_down);
+        if (!slot_half)
         {
-            half* slot_out = ((half*) output_scratch) + fused_base[expert_idx] * (int64_t) hidden_dim;
-            gemm_down(temp_intermediate_g, slot_out, exp_down_trellis, K_down);
-        }
-        else
-        {
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for d + scatter add
