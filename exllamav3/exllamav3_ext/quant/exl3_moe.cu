@@ -46,17 +46,23 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
     exl3_moe_kernel_k8_n128_cb1(), exl3_moe_kernel_k8_n256_cb1(), exl3_moe_kernel_k8_n128_cb2(), exl3_moe_kernel_k8_n256_cb2()
 };
 
-// 32-row tile instances, [K], N = 128 shape, mul1 codebook only
+// 32-row tile instances, [cb - 1][K], N = 128 shape
 fp_exl3_moe_kernel exl3_moe_kernel_instances_m32[] =
 {
+    exl3_moe_kernel_k0_n128_cb1_m32(), exl3_moe_kernel_k1_n128_cb1_m32(), exl3_moe_kernel_k2_n128_cb1_m32(),
+    exl3_moe_kernel_k3_n128_cb1_m32(), exl3_moe_kernel_k4_n128_cb1_m32(), exl3_moe_kernel_k5_n128_cb1_m32(),
+    exl3_moe_kernel_k6_n128_cb1_m32(), exl3_moe_kernel_k7_n128_cb1_m32(), exl3_moe_kernel_k8_n128_cb1_m32(),
     exl3_moe_kernel_k0_n128_cb2_m32(), exl3_moe_kernel_k1_n128_cb2_m32(), exl3_moe_kernel_k2_n128_cb2_m32(),
     exl3_moe_kernel_k3_n128_cb2_m32(), exl3_moe_kernel_k4_n128_cb2_m32(), exl3_moe_kernel_k5_n128_cb2_m32(),
     exl3_moe_kernel_k6_n128_cb2_m32(), exl3_moe_kernel_k7_n128_cb2_m32(), exl3_moe_kernel_k8_n128_cb2_m32()
 };
 
-// 64-row tile instances, [K], N = 128 shape, mul1 codebook only
+// 64-row tile instances, [cb - 1][K], N = 128 shape
 fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[] =
 {
+    exl3_moe_kernel_k0_n128_cb1_m64(), exl3_moe_kernel_k1_n128_cb1_m64(), exl3_moe_kernel_k2_n128_cb1_m64(),
+    exl3_moe_kernel_k3_n128_cb1_m64(), exl3_moe_kernel_k4_n128_cb1_m64(), exl3_moe_kernel_k5_n128_cb1_m64(),
+    exl3_moe_kernel_k6_n128_cb1_m64(), exl3_moe_kernel_k7_n128_cb1_m64(), exl3_moe_kernel_k8_n128_cb1_m64(),
     exl3_moe_kernel_k0_n128_cb2_m64(), exl3_moe_kernel_k1_n128_cb2_m64(), exl3_moe_kernel_k2_n128_cb2_m64(),
     exl3_moe_kernel_k3_n128_cb2_m64(), exl3_moe_kernel_k4_n128_cb2_m64(), exl3_moe_kernel_k5_n128_cb2_m64(),
     exl3_moe_kernel_k6_n128_cb2_m64(), exl3_moe_kernel_k7_n128_cb2_m64(), exl3_moe_kernel_k8_n128_cb2_m64()
@@ -284,13 +290,13 @@ void exl3_moe
     }
     else
     {
-        // The wide row tiles exist as N = 128 instances only and take any dims that are
+        // The wide row tiles exist as N = 128 instances only (mcg and mul1) and take any dims that are
         // multiples of 128: for dims that are multiples of 256 they still beat the N = 256
         // 16-row tiling by ~20% at 24+ rows per expert (the N = 256 instance stays the faster
         // one for the <= 16-row launch, which the caller issues with m_tile 16)
-        TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
-        kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+        kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[9 * cb_idx + K]
+                              : exl3_moe_kernel_instances_m32[9 * cb_idx + K];
     }
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
