@@ -97,6 +97,22 @@ struct MoeCoop2Params
     float* slot_w;              // (slots_cap) routing weight * activation scale per slot (fast combine), nullable
     int dbg;                    // EXL3_MOE_COOP2_DBG (profiling): 1 skip dequant+MMA, 2 skip operand staging,
                                 // 4 no unit L2 prefetch, 8 no evict-first hint, 16 no down combine, 32 no gate/up epilogue, 64 slow combine
+
+    // ws mode only: the shared expert folded into the launches (s_ptrs null: not folded)
+    const int64_t* s_ptrs;      // [gate trellis, suh, svh, up trellis, suh, svh, down trellis, suh, svh]
+    int I_s;                    // shared intermediate width (multiple of 128)
+    int cg_as;                  // 256-column groups of I_s
+    int ks_as;                  // k segments per shared gate/up unit (0: picked per step)
+    int ks_bs;                  // k segments per shared down unit (0: picked per step)
+    int cap_s;                  // shared partial-sum capacity in k segments per row
+    float* part_a_s;            // (nproj, cap_s, bsz, I_s)
+    float* act32_s;             // (bsz, I_s)
+    float* peak_s;              // (bsz, I_s / 128)
+    float* part_b_s;            // (cap_s, bsz, Ho)
+    float* slot_w_s;            // (bsz) shared activation scale per row
+    int* ctr_a_s;               // (ceil(bsz / 16), cg_as) arrivals per (shared run, group)
+    int ctr_a_s_len;
+    int s_first;                // ws unit order: 1 shared units first, 0 routed first
 };
 
 // Scratch lengths for a geometry (slots_cap = rows_max * top_k <= MOE_COOP2_MAX_SLOTS): the

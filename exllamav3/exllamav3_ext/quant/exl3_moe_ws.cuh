@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <vector>
 
 // exl3_moe_coop2, warp-specialised mode (exl3_moe_ws_kernel.cuh): exl3_moe_coop2's arguments and
 // scratch (the counter scratch at its full length), then the run length (16 or 32 rows, 0: by the
@@ -32,5 +33,17 @@ void exl3_moe_coop2_ws
     int ks_a,
     int ks_b,
     int rm,
-    int fill_pct
+    int fill_pct,
+    const c10::optional<at::Tensor>& s_ptrs,     // the shared expert folded in: [gate, up, down] x [trellis, suh, svh] (ungated: gate = up)
+    int K_s,                                     // its width
+    int I_s,                                     // its intermediate width
+    const c10::optional<at::Tensor>& s_scratch,  // fp32, exl3_moe_coop2_ws_shared_scratch()[0] elements
+    const c10::optional<at::Tensor>& s_ctr,      // int32, [1] elements, zero before the first call
+    int s_first                                  // 1: shared units ahead of the routed ones
 );
+
+// Shared-expert scratch for steps of up to rows_max rows: {fp32 elements, int32 elements}
+std::vector<int64_t> exl3_moe_coop2_ws_shared_scratch(int rows_max, int I_s, int Ho, bool gated);
+
+// Whether a K_s-bit shared expert folds into K_gu / K_d-bit routed experts
+bool exl3_moe_coop2_ws_can_fold(int K_gu, int K_d, int K_s);

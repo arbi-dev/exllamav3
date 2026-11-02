@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "../util.h"
 #include "../util.cuh"
@@ -24,11 +25,11 @@ namespace {
 #define EXL3_MOE_WS_KSET(X) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8)
 #endif
 
-void* ws_kernel(bool is_b, int K, int cb, int rm)
+void* ws_kernel(bool is_b, int K, int Ks, int cb, int rm)
 {
     switch (K)
     {
-        #define EXL3_MOE_WS_CASE(k) case k: return is_b ? exl3_moe_ws_kernel_b_k##k(cb, rm) : exl3_moe_ws_kernel_a_k##k(cb, rm);
+        #define EXL3_MOE_WS_CASE(k) case k: return is_b ? exl3_moe_ws_kernel_b_k##k(Ks, cb, rm) : exl3_moe_ws_kernel_a_k##k(Ks, cb, rm);
         EXL3_MOE_WS_KSET(EXL3_MOE_WS_CASE)
         #undef EXL3_MOE_WS_CASE
         default: return nullptr;
@@ -70,7 +71,38 @@ int env_int_ws(const char* name, int dflt)
     return v ? atoi(v) : dflt;
 }
 
+// Shared-expert scratch of a step of `rows` rows: fp32 [part_a_s | act32_s | peak_s | part_b_s |
+// slot_w_s] and int32 [ctr_a_s], the k split capped at WS_CAP_S segments
+constexpr int WS_CAP_S = 8;
+
+struct WsSharedLayout { int64_t part_a, act32, peak, part_b, slot_w, f32, ctr; };
+
+WsSharedLayout ws_shared_layout(int64_t rows, int64_t I_s, int64_t Ho, bool gated)
+{
+    WsSharedLayout l;
+    const int64_t nproj = gated ? 2 : 1;
+    l.part_a = 0;
+    l.act32 = l.part_a + nproj * WS_CAP_S * rows * I_s;
+    l.peak = l.act32 + rows * I_s;
+    l.part_b = l.peak + rows * (I_s / 128);
+    l.slot_w = l.part_b + WS_CAP_S * rows * Ho;
+    l.f32 = l.slot_w + rows;
+    l.ctr = ((rows + 15) / 16) * ((I_s + 255) / 256);
+    return l;
+}
+
 }  // namespace
+
+std::vector<int64_t> exl3_moe_coop2_ws_shared_scratch(int rows_max, int I_s, int Ho, bool gated)
+{
+    const WsSharedLayout l = ws_shared_layout(rows_max, I_s, Ho, gated);
+    return { l.f32, l.ctr };
+}
+
+bool exl3_moe_coop2_ws_can_fold(int K_gu, int K_d, int K_s)
+{
+    return (K_s == K_gu || K_s == 6) && (K_s == K_d || K_s == 6);
+}
 
 void exl3_moe_coop2_ws
 (
@@ -99,7 +131,13 @@ void exl3_moe_coop2_ws
     int ks_a,
     int ks_b,
     int rm,
-    int fill_pct
+    int fill_pct,
+    const c10::optional<at::Tensor>& s_ptrs,
+    int K_s,
+    int I_s,
+    const c10::optional<at::Tensor>& s_scratch,
+    const c10::optional<at::Tensor>& s_ctr,
+    int s_first
 )
 {
     using namespace exl3_moe_ws_ns;
@@ -117,10 +155,36 @@ void exl3_moe_coop2_ws
     const int cb = mcg ? 1 : (mul1 ? 2 : 0);
     if (rm <= 0) rm = p.bsz <= 16 ? 16 : 32;
     TORCH_CHECK(rm == 16 || rm == 32, "exl3_moe_coop2_ws: run length must be 16 or 32");
-    void* ka = ws_kernel(false, K_gu, cb, rm);
-    void* kb = ws_kernel(true, Kd, cb, rm);
+    const bool fold = s_ptrs.has_value();
+    if (fold)
+    {
+        TORCH_CHECK(exl3_moe_coop2_ws_can_fold(K_gu, Kd, K_s), "exl3_moe_coop2_ws: no kernel folds a ", K_s, "-bit shared expert into ", K_gu, "/", Kd, "-bit experts");
+        TORCH_CHECK(!sh_out, "exl3_moe_coop2_ws: a folded shared expert takes no shared output");
+        TORCH_CHECK(I_s > 0 && I_s % KC == 0, "exl3_moe_coop2_ws: shared intermediate width must be a multiple of 128");
+        TORCH_CHECK(s_ptrs->scalar_type() == at::kLong && s_ptrs->numel() == 9 && s_ptrs->is_contiguous(), "exl3_moe_coop2_ws: s_ptrs must be 9 contiguous int64");
+        TORCH_CHECK(s_scratch && s_ctr, "exl3_moe_coop2_ws: a folded shared expert needs its scratch");
+        const WsSharedLayout l = ws_shared_layout(p.bsz, I_s, p.Ho, gated);
+        TORCH_CHECK(s_scratch->scalar_type() == at::kFloat && s_scratch->is_contiguous() && s_scratch->numel() >= l.f32, "exl3_moe_coop2_ws: shared scratch too small");
+        TORCH_CHECK(s_ctr->scalar_type() == at::kInt && s_ctr->is_contiguous() && s_ctr->numel() >= l.ctr, "exl3_moe_coop2_ws: shared counter scratch too small");
+        float* f = (float*) s_scratch->data_ptr();
+        p.s_ptrs = (const int64_t*) s_ptrs->data_ptr();
+        p.I_s = I_s;
+        p.cg_as = CEIL_DIVIDE(I_s, GCOLS);
+        p.cap_s = WS_CAP_S;
+        p.part_a_s = f + l.part_a;
+        p.act32_s = f + l.act32;
+        p.peak_s = f + l.peak;
+        p.part_b_s = f + l.part_b;
+        p.slot_w_s = f + l.slot_w;
+        p.ctr_a_s = (int*) s_ctr->data_ptr();
+        p.ctr_a_s_len = (int) l.ctr;
+        p.s_first = s_first;
+    }
+    const int Ks_a = fold ? K_s : K_gu, Ks_b = fold ? K_s : Kd;
+    void* ka = ws_kernel(false, K_gu, Ks_a, cb, rm);
+    void* kb = ws_kernel(true, Kd, Ks_b, cb, rm);
     TORCH_CHECK(ka && kb, "exl3_moe_coop2_ws: no kernel for this width");
-    const int sm_a = ws_smem(K_gu, rm), sm_b = ws_smem(Kd, rm);
+    const int sm_a = ws_smem(std::max(K_gu, Ks_a), rm), sm_b = ws_smem(std::max(Kd, Ks_b), rm);
 
     const int nproj = gated ? 2 : 1;
     p.cap_a = (int) std::min<int64_t>(part_a.numel() / ((int64_t) nproj * p.I), 1 << 20);
@@ -160,12 +224,20 @@ void exl3_moe_coop2_ws
     if (fill_pct <= 0) fill_pct = env_int_ws("EXL3_MOE_COOP2_WS_FILL", 100);
     const int sms = DevCtx::instance().get_num_sms(device);
     const int ca = p.Hi / KC, cbk = p.I / KC;
-    const int max_a = p.slots * nproj * p.cg_a * std::max(1, std::min(ca, p.cap_a / p.slots));
-    const int max_b = p.slots * p.cg_b * std::max(1, std::min(cbk, p.cap_b / p.slots));
+    int max_a = p.slots * nproj * p.cg_a * std::max(1, std::min(ca, p.cap_a / p.slots));
+    int max_b = p.slots * p.cg_b * std::max(1, std::min(cbk, p.cap_b / p.slots));
+    if (fold)
+    {
+        const int n_sr = CEIL_DIVIDE(p.bsz, 16);
+        max_a += n_sr * nproj * p.cg_as * std::min(ca, WS_CAP_S);
+        max_b += n_sr * p.cg_b * std::min(I_s / KC, WS_CAP_S);
+    }
     const int grid_a = std::min(max_a, std::max(1, sms * ws_occupancy(ka, sm_a, device) * fill_pct / 100));
     const int grid_b = std::min(max_b, std::max(1, sms * ws_occupancy(kb, sm_b, device) * fill_pct / 100));
 
     void* args[] = { (void*) &p };
-    cuda_check(cudaLaunchKernel(ka, dim3(grid_a), dim3(WTHREADS), args, sm_a, stream));
-    cuda_check(cudaLaunchKernel(kb, dim3(grid_b), dim3(WTHREADS), args, sm_b, stream));
+    // EXL3_MOE_COOP2_WS_ONLY (profiling): 1 kernel A alone, 2 kernel B alone (on the last step's activation)
+    const int only = env_int_ws("EXL3_MOE_COOP2_WS_ONLY", 0);
+    if (only != 2) cuda_check(cudaLaunchKernel(ka, dim3(grid_a), dim3(WTHREADS), args, sm_a, stream));
+    if (only != 1) cuda_check(cudaLaunchKernel(kb, dim3(grid_b), dim3(WTHREADS), args, sm_b, stream));
 }
