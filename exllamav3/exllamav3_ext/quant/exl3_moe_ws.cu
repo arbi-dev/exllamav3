@@ -91,7 +91,17 @@ WsSharedLayout ws_shared_layout(int64_t rows, int64_t I_s, int64_t Ho, bool gate
     return l;
 }
 
+at::Tensor g_ws_trace;
+int g_ws_trace_ga = 0;
+
 }  // namespace
+
+// Profiling: the last traced call's stamps (grid_a + grid_b, 64) and grid_a
+std::vector<at::Tensor> exl3_moe_coop2_ws_trace()
+{
+    if (!g_ws_trace.defined()) return {};
+    return { g_ws_trace.cpu(), at::full({1}, g_ws_trace_ga, at::kLong) };
+}
 
 std::vector<int64_t> exl3_moe_coop2_ws_shared_scratch(int rows_max, int I_s, int Ho, bool gated)
 {
@@ -238,6 +248,16 @@ void exl3_moe_coop2_ws
     void* args[] = { (void*) &p };
     // EXL3_MOE_COOP2_WS_ONLY (profiling): 1 kernel A alone, 2 kernel B alone (on the last step's activation)
     const int only = env_int_ws("EXL3_MOE_COOP2_WS_ONLY", 0);
+    // EXL3_MOE_COOP2_TRACE (profiling): per-block globaltimer stamps, kernel A's blocks then B's
+    MoeCoop2Params pb = p;
+    if (env_int_ws("EXL3_MOE_COOP2_TRACE", 0))
+    {
+        g_ws_trace = at::zeros({grid_a + grid_b, exl3_moe_coop2_ns::TRACE_W}, x.options().dtype(at::kLong));
+        g_ws_trace_ga = grid_a;
+        p.trace = (long long*) g_ws_trace.data_ptr();
+        pb.trace = p.trace + (size_t) grid_a * exl3_moe_coop2_ns::TRACE_W;
+    }
+    void* args_b[] = { (void*) &pb };
     if (only != 2) cuda_check(cudaLaunchKernel(ka, dim3(grid_a), dim3(WTHREADS), args, sm_a, stream));
-    if (only != 1) cuda_check(cudaLaunchKernel(kb, dim3(grid_b), dim3(WTHREADS), args, sm_b, stream));
+    if (only != 1) cuda_check(cudaLaunchKernel(kb, dim3(grid_b), dim3(WTHREADS), args_b, sm_b, stream));
 }

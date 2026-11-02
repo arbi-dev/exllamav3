@@ -45,5 +45,10 @@ void exl3_moe_coop2_ws
 // Shared-expert scratch for steps of up to rows_max rows: {fp32 elements, int32 elements}
 std::vector<int64_t> exl3_moe_coop2_ws_shared_scratch(int rows_max, int I_s, int Ho, bool gated);
 
+// Profiling (EXL3_MOE_COOP2_TRACE=1): the last traced call's stamps and kernel A's grid. Per block:
+// [0] start, [1] run table built, [2] exit, [3] units | ks << 32 | ks_shared << 48; per unit i < 20:
+// [4 + 3i] start, [5 + 3i] consumed, [6 + 3i] arrival and epilogue / combine done
+std::vector<at::Tensor> exl3_moe_coop2_ws_trace();
+
 // Whether a K_s-bit shared expert folds into K_gu / K_d-bit routed experts
 bool exl3_moe_coop2_ws_can_fold(int K_gu, int K_d, int K_s);

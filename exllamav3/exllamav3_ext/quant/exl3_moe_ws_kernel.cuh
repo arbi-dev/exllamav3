@@ -676,6 +676,7 @@ void exl3_moe_ws_a_kernel(const MoeCoop2Params p)
     __shared__ WsTable<RM> rt;
     __shared__ WsSync sy;
 
+    trace_at(p, 0, gtimer());
     for (int i = blockIdx.x * WTHREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * WTHREADS) p.ctr_b[i] = 0;
     ws_prologue(sy);
     fill_srow<RM>(p, rt);
@@ -696,6 +697,8 @@ void exl3_moe_ws_a_kernel(const MoeCoop2Params p)
     const int n_units = st.n_r + st.n_s;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
+    trace_at(p, 1, gtimer());
+    trace_at(p, 3, (uint64_t) n_units | ((uint64_t) st.ks_a << 32) | ((uint64_t) st.ks_as << 48));
 
     if (warp == WPW)
     {
@@ -736,11 +739,13 @@ void exl3_moe_ws_a_kernel(const MoeCoop2Params p)
         const Item x = item_a<RM>(p, rt, st, u);
         const int I = x.sh ? p.I_s : p.I;
         const int ntiles = I / 16;
+        const uint64_t t_u0 = p.trace ? gtimer() : 0;
         FragC acc[RM / 16][WNT][2];
         if constexpr (bits == bits_s) consume_unit<bits, cb, RM, STW>(p, ntiles, x.group, x.c0, x.c1, x.nrows, ring, obuf, sy, gs, go, acc);
         else if (x.sh) consume_unit<bits_s, cb, RM, STW>(p, ntiles, x.group, x.c0, x.c1, x.nrows, ring, obuf, sy, gs, go, acc);
         else consume_unit<bits, cb, RM, STW>(p, ntiles, x.group, x.c0, x.c1, x.nrows, ring, obuf, sy, gs, go, acc);
 
+        if (ui < 20) { trace_at(p, 4 + ui * 3, t_u0); trace_at(p, 5 + ui * 3, gtimer()); }
         const int ks = x.sh ? st.ks_as : st.ks_a;
         const int nr = x.sh ? p.bsz : p.slots;
         float* pbase = x.sh ? p.part_a_s : p.part_a;
@@ -781,7 +786,9 @@ void exl3_moe_ws_a_kernel(const MoeCoop2Params p)
             }
             epilogue_a(p, ep, x.rows, x.nrows, x.group);
         }
+        if (ui < 20) trace_at(p, 6 + ui * 3, gtimer());
     }
+    trace_at(p, 2, gtimer());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -902,6 +909,7 @@ void exl3_moe_ws_b_kernel(const MoeCoop2Params p)
     __shared__ WsTable<RM> rt;
     __shared__ WsSync sy;
 
+    trace_at(p, 0, gtimer());
     for (int i = blockIdx.x * WTHREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * WTHREADS) p.ctr_a[i] = 0;
     for (int i = blockIdx.x * WTHREADS + threadIdx.x; i < p.ctr_a_s_len; i += gridDim.x * WTHREADS) p.ctr_a_s[i] = 0;
     // A token with no active slot on this rank: the shared term alone, or zeros (folded: its
@@ -930,6 +938,8 @@ void exl3_moe_ws_b_kernel(const MoeCoop2Params p)
     const int ntiles = p.Ho / 16;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
+    trace_at(p, 1, gtimer());
+    trace_at(p, 3, (uint64_t) n_units | ((uint64_t) st.ks_b << 32) | ((uint64_t) st.ks_bs << 48));
 
     if (warp == WPW)
     {
@@ -982,10 +992,12 @@ void exl3_moe_ws_b_kernel(const MoeCoop2Params p)
     for (int u = blockIdx.x; u < n_units; u += gridDim.x, ++ui)
     {
         const Item x = item_b<RM>(p, rt, st, u);
+        const uint64_t t_u0 = p.trace ? gtimer() : 0;
         FragC acc[RM / 16][WNT][2];
         if constexpr (bits == bits_s) consume_unit<bits, cb, RM, STW>(p, ntiles, x.group, x.c0, x.c1, x.nrows, ring, obuf, sy, gs, go, acc);
         else if (x.sh) consume_unit<bits_s, cb, RM, STW>(p, ntiles, x.group, x.c0, x.c1, x.nrows, ring, obuf, sy, gs, go, acc);
         else consume_unit<bits, cb, RM, STW>(p, ntiles, x.group, x.c0, x.c1, x.nrows, ring, obuf, sy, gs, go, acc);
+        if (ui < 20) { trace_at(p, 4 + ui * 3, t_u0); trace_at(p, 5 + ui * 3, gtimer()); }
         float* part = x.sh ? p.part_b_s + (size_t) x.ks * p.bsz * p.Ho : p.part_b + (size_t) x.ks * p.slots * p.Ho;
         store_partials_ws<RM>(part, p.Ho, ntiles, x.group, x.rows, x.nrows, acc);
 
@@ -1010,7 +1022,9 @@ void exl3_moe_ws_b_kernel(const MoeCoop2Params p)
         cbar_sync();
         const unsigned done = sy.done[ui & 1];
         if (done) combine_rows_ws<RM>(p, rt, st, x, done);
+        if (ui < 20) trace_at(p, 6 + ui * 3, gtimer());
     }
+    trace_at(p, 2, gtimer());
 }
 
 }  // namespace exl3_moe_ws_ns
