@@ -25,15 +25,19 @@ constexpr int SPC = KC / 16;                    // k slices per chunk
 constexpr int AST = KC + 8;                     // staged operand row stride (halves), bank-padded
 constexpr int SMAX = MOE_COOP2_MAX_SLOTS;
 constexpr int EMAX = MOE_COOP2_MAX_EXPERTS;
-constexpr int RING_BYTES = 4096;                // weight ring per warp
+constexpr int RING_BYTES = 2048;                // weight ring per warp: RING_SLICES slices at 8 bits
 constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
 
 static_assert(GCOLS == MOE_COOP2_GROUP_COLS, "group width mismatch");
 
 template <int bits> __host__ __device__ constexpr int slice_words() { return WNT * 8 * bits; }
+// Slices a warp keeps in flight: 4 at every width. More only lengthens the cp.async prologue each
+// unit pays before its first decode (units are few per block at decode sizes), and four slices
+// a warp already keep more bytes in flight per SM than DRAM needs
+constexpr int RING_SLICES = 4;
 template <int bits> __host__ __device__ constexpr int ring_depth()
 {
-    return RING_BYTES / (slice_words<bits>() * 4) < 16 ? RING_BYTES / (slice_words<bits>() * 4) : 16;
+    return RING_BYTES / (slice_words<bits>() * 4) < RING_SLICES ? RING_BYTES / (slice_words<bits>() * 4) : RING_SLICES;
 }
 constexpr int RING_WORDS = RING_BYTES / 4;
 
