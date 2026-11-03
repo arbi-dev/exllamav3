@@ -88,6 +88,9 @@ int env_int(const char* name, int dflt)
 
 struct Coop2Plan { int ks_a, ks_b, grid_a, grid_b; };
 
+// Deepest down unit, in 128-k chunks (pick_ks); EXL3_MOE_COOP2_MAXC_B overrides, 0 = no bound
+int coop2_maxc_b() { return env_int("EXL3_MOE_COOP2_MAXC_B", MOE_COOP2_MAX_DOWN_CHUNKS); }
+
 // Persistent grids sized to the card (EXL3_MOE_COOP2_FILL scales them, racing), at most one block
 // per possible unit. The k split is the kernels' own per-step choice (pick_ks, from the step's
 // run count) unless forced (ks_a / ks_b, or EXL3_MOE_COOP2_KSA / _KSB); the plan reports the
@@ -95,6 +98,7 @@ struct Coop2Plan { int ks_a, ks_b, grid_a, grid_b; };
 Coop2Plan coop2_plan(int bsz, int topk, int Hi, int I, int Ho, bool gated, int cap_a, int cap_b, int device,
                      void* ka, void* kb, int ks_a_req, int ks_b_req, bool resolve)
 {
+    const int maxc_b = coop2_maxc_b();
     using namespace exl3_moe_coop2_ns;
     const int slots = bsz * topk;
     const int nproj = gated ? 2 : 1;
@@ -113,7 +117,7 @@ Coop2Plan coop2_plan(int bsz, int topk, int Hi, int I, int Ho, bool gated, int c
     const int fa = ks_a_req > 0 ? ks_a_req : env_int("EXL3_MOE_COOP2_KSA", 0);
     const int fb = ks_b_req > 0 ? ks_b_req : env_int("EXL3_MOE_COOP2_KSB", 0);
     pl.ks_a = fa > 0 ? std::min(fa, kcap_a) : (resolve ? exl3_moe_coop2_ns::pick_ks(slots * nproj * cg_a, ca, pl.grid_a, cap_a / slots) : 0);
-    pl.ks_b = fb > 0 ? std::min(fb, kcap_b) : (resolve ? exl3_moe_coop2_ns::pick_ks(slots * cg_b, cbk, pl.grid_b, cap_b / slots) : 0);
+    pl.ks_b = fb > 0 ? std::min(fb, kcap_b) : (resolve ? exl3_moe_coop2_ns::pick_ks(slots * cg_b, cbk, pl.grid_b, cap_b / slots, maxc_b) : 0);
     return pl;
 }
 
@@ -231,6 +235,7 @@ void exl3_moe_coop2
     p.dbg = env_int("EXL3_MOE_COOP2_DBG", 0);
     p.pfd = env_int("EXL3_MOE_COOP2_PFD", 0);
     p.pfd_b = env_int("EXL3_MOE_COOP2_PFD_B", 0);
+    p.maxc_b = coop2_maxc_b();
 
     const int K_gu = gated ? Kg : Ku;
     const int cb = coop2_cb(mcg, mul1);

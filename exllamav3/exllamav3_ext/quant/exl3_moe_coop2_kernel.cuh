@@ -149,9 +149,11 @@ __device__ __forceinline__ int token_active_slots(const MoeCoop2Params& p, int r
     return n;
 }
 
-// Power-of-two scale bringing a slot's activation peak to at most MOE_COOP2_ACT_AUTO_PEAK
-// (1 when it already fits). Pure function of the slot's chunk peaks: kernel B's staging and its
-// combine compute the same value
+// Power-of-two scale bringing a slot's activation peak into (MOE_COOP2_ACT_AUTO_PEAK / 2,
+// MOE_COOP2_ACT_AUTO_PEAK]: down for a large activation (fp16 range), UP for a small one, whose fp16
+// operand would otherwise sit in the low exponents and lose precision (a 1e-3 activation gave the
+// down stage 1e-1 relative error). Exact either way. Pure function of the slot's chunk peaks:
+// kernel B's staging and its combine compute the same value
 __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int lane)
 {
     if (!p.act_auto) return 1.0f;
@@ -160,19 +162,23 @@ __device__ __forceinline__ float slot_scale(const MoeCoop2Params& p, int s, int 
     for (int c = lane; c < nc; c += 32) m = fmaxf(m, __ldcg(p.peak + (size_t) s * nc + c));
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    if (!(m <= 3.0e38f)) return 1.0f;   // non-finite: counted by kernel A, nothing to rescue
-    return m > MOE_COOP2_ACT_AUTO_PEAK ? exp2f(ceilf(log2f(m / MOE_COOP2_ACT_AUTO_PEAK))) : 1.0f;
+    if (!(m <= 3.0e38f) || m == 0.0f) return 1.0f;   // non-finite (counted by kernel A) or all zero
+    return exp2f(fmaxf(ceilf(log2f(m / MOE_COOP2_ACT_AUTO_PEAK)), -96.0f));
 }
 
 // K segments per unit for a step of u1 (run, projection, group) tiles of `chunks` k chunks on a
 // grid of G blocks: the split that minimises waves * (chunks per unit + a unit's fixed cost of
-// half a chunk), ties to the smaller split. Bounded by the partial-sum capacity. Every block
+// half a chunk), ties to the smaller split. Bounded by the partial-sum capacity, and from below
+// by max_chunks (0: none), the deepest unit: a down unit waits for its run's activation, and a
+// deep one that starts late is the step's tail, which the wave count does not see. Every block
 // computes the same value from the same run table: a pure function of the routing
-__host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int cap)
+__host__ __device__ __forceinline__ int pick_ks(int u1, int chunks, int G, int cap, int max_chunks = 0)
 {
     const int hi = chunks < cap ? chunks : cap;
-    int best = 1, best_cost = 0x7fffffff;
-    for (int ks = 1; ks <= hi; ++ks)
+    int lo = max_chunks > 0 ? (chunks + max_chunks - 1) / max_chunks : 1;
+    lo = lo < 1 ? 1 : (lo > hi ? hi : lo);
+    int best = lo, best_cost = 0x7fffffff;
+    for (int ks = lo; ks <= hi; ++ks)
     {
         const int per = (chunks + ks - 1) / ks;
         const int waves = (u1 * ks + G - 1) / G;
@@ -991,7 +997,7 @@ void exl3_moe_coop2_b_kernel(const MoeCoop2Params p)
 
     build_runs(p, rt, ring);
 
-    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots);
+    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots, p.maxc_b);
     const int n_units = rt.n_runs * p.cg_b * ks_b;
     for (int u = blockIdx.x; u < n_units; u += gridDim.x)
         b_unit<bits, cb, false>(p, rt, u, ks_b, 0, ring, abuf, us, nullptr);
@@ -1030,7 +1036,7 @@ void exl3_moe_coop2_f_kernel(const MoeCoop2Params p)
 
     const int nproj = p.gated ? 2 : 1;
     const int ks_a = p.ks_a > 0 ? p.ks_a : pick_ks(rt.n_runs * nproj * p.cg_a, p.Hi / KC, gridDim.x, p.cap_a / p.slots);
-    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots);
+    const int ks_b = p.ks_b > 0 ? p.ks_b : pick_ks(rt.n_runs * p.cg_b, p.I / KC, gridDim.x, p.cap_b / p.slots, p.maxc_b);
     const int n_a = rt.n_runs * nproj * p.cg_a * ks_a;
     const int n_b = rt.n_runs * p.cg_b * ks_b;
     const int pfd_a = (n_a <= (int) gridDim.x && !(p.dbg & 4)) ? p.pfd : 0;

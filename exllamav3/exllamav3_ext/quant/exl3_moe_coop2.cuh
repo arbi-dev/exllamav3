@@ -36,6 +36,9 @@
 #define MOE_COOP2_MAX_EXPERTS 1024
 #define MOE_COOP2_GROUP_COLS 256
 
+// Deepest down unit the kernels' k split leaves, in 128-k chunks (pick_ks)
+#define MOE_COOP2_MAX_DOWN_CHUNKS 5
+
 // act_auto: the stored activation peak bound (the down stage accumulates in fp32; the bound
 // keeps the fp16 operand itself well inside range)
 #define MOE_COOP2_ACT_AUTO_PEAK 1024.0f
@@ -78,6 +81,7 @@ struct MoeCoop2Params
     int cg_b;                   // 256-column groups of Ho
     int ks_a;                   // k segments per gate/up unit; 0: the kernels pick per step (pick_ks)
     int ks_b;                   // k segments per down unit; 0: the kernels pick per step
+    int maxc_b;                 // deepest down unit the kernels' pick leaves, in 128-k chunks (0: no bound)
     int cap_a;                  // part_a capacity in (k segment, slot) rows per projection: ks_a * slots <= cap_a
     int cap_b;                  // part_b capacity in (k segment, slot) rows: ks_b * slots <= cap_b
     bool act_auto;
