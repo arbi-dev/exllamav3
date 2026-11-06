@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include "exl3_gemm.cuh"
+#include "exl3_gemm_lock_size.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -29,6 +30,10 @@ EXL3 matmul, A @ B -> C
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
 - svh: optional, packed output scales/flips, shape (n//16), dtype float16
+- locks: optional caller-owned contiguous CUDA int32 vector, on A's device, initially zero.
+  Requires exl3_gemm_lock_elements(output_width) entries. It must outlive every launch/captured
+  replay using it, and sharing callers must be ordered. Independent streams use independent
+  vectors. Omitted: preserves the legacy per-device workspace and its serialized-use contract.
 - size_n_out: optional output width. 0 emits every column B stores. A positive value emits the
   LEADING size_n_out columns of B and reads only the trellis blocks and svh entries they need,
   so a caller wanting a narrow projection can pass the wide weight itself instead of a
@@ -104,6 +109,18 @@ uint64_t mgemm_autotune_hash
     return h;
 }
 
+// The regular GEMM kernel processes M strips serially (grid.sync between strips).
+// Its inner reduction has slice_m == 0 and accesses only locks[slice2_n], with
+// slice2_n < size_n / TILESIZE_N. All kernel instantiations statically require
+// TILESIZE_N % 128 == 0, so N/128 counters cover every shape, independent of M.
+// MGEMM/MoE additionally use scheduler/barrier storage and do NOT use this bound.
+int64_t exl3_gemm_lock_elements(int64_t size_n)
+{
+    TORCH_CHECK(size_n > 0 && size_n % 128 == 0,
+                "exl3_gemm_lock_elements: output width must be a positive multiple of 128");
+    return exl3_gemm_lock_count(size_n);
+}
+
 int exl3_gemm_gr
 (
     const at::Tensor& A,
@@ -117,7 +134,8 @@ int exl3_gemm_gr
     bool mul1,
     int force_num_sms,
     Graph* graph,
-    int size_n_out
+    int size_n_out,
+    const c10::optional<at::Tensor>& owned_locks
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -170,7 +188,20 @@ int exl3_gemm_gr
     cudaGetDevice(&device);
     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
-    int* locks = DevCtx::instance().get_locks(device);
+    int* locks;
+    if (owned_locks)
+    {
+        const at::Tensor& buffer = owned_locks.value();
+        TORCH_CHECK(buffer.is_cuda() && buffer.device() == A.device(),
+                    "exl3_gemm: locks must be a CUDA tensor on A's device");
+        TORCH_CHECK(buffer.scalar_type() == at::kInt && buffer.dim() == 1 && buffer.is_contiguous(),
+                    "exl3_gemm: locks must be a contiguous one-dimensional int32 tensor");
+        TORCH_CHECK(buffer.numel() >= exl3_gemm_lock_elements(size_n_out ? size_n_out : size_n_stored),
+                    "exl3_gemm: locks buffer is too small for the output width");
+        locks = buffer.data_ptr<int>();
+    }
+    else
+        locks = DevCtx::instance().get_locks(device);
 
     // Dispatch
     int K = B.size(2) / 16;
@@ -337,7 +368,8 @@ int exl3_gemm
     bool mcg,
     bool mul1,
     int force_num_sms,
-    int size_n_out
+    int size_n_out,
+    const c10::optional<at::Tensor>& owned_locks
 )
 {
     return exl3_gemm_gr
@@ -353,7 +385,8 @@ int exl3_gemm
         mul1,
         force_num_sms,
         nullptr,
-        size_n_out
+        size_n_out,
+        owned_locks
     );
 }
 
