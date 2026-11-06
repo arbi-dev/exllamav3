@@ -16,7 +16,8 @@ int exl3_gemm_gr
     bool mul1,
     int force_num_sms,
     Graph* graph,
-    int size_n_out = 0
+    int size_n_out = 0,
+    const c10::optional<at::Tensor>& locks = {}
 );
 
 int exl3_gemm
@@ -31,7 +32,8 @@ int exl3_gemm
     bool mcg,
     bool mul1,
     int force_num_sms,
-    int size_n_out = 0
+    int size_n_out = 0,
+    const c10::optional<at::Tensor>& locks = {}
 );
 
 int exl3_mgemm_gr
@@ -86,3 +88,8 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& had_src_list = {},
     int num_had_src = 0
 );
+
+// Number of int32 counters needed by one non-overlapping GEMM execution domain.
+// The caller zero-initializes once, keeps storage alive through captured replays,
+// and orders all launches sharing that storage on one stream (or explicit fences).
+int64_t exl3_gemm_lock_elements(int64_t size_n);
