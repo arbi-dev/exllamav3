@@ -149,3 +149,20 @@ def test_vision_native_overlaps_text_native_with_owned_locks(ext, captured):
             assert torch.equal(vision_copy, vision_ref)
             assert torch.equal(text_copy, text_ref)
     assert torch.count_nonzero(locks) == 0
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_owned_locks_do_not_enter_device_global_int8_workspace(ext, monkeypatch, rows):
+    monkeypatch.setenv("EXL3_INT8_GEMV", "2")
+    args = operands(rows, 5120, 1024, 4)
+    # A nonzero output width excludes the experimental INT8 path for the serial
+    # reference. The owned path must provide the same isolation even when the
+    # public API's default output-width argument is used. No unsafe overlap is
+    # needed to exercise this dispatch contract.
+    assert launch(ext, args, shape=2, sms=64, n_out=1024) == 2
+    reference = args[2].clone()
+    locks = torch.zeros(ext.exl3_gemm_lock_elements(1024), device="cuda", dtype=torch.int32)
+    assert launch(ext, args, shape=2, sms=64, locks=locks) == 2
+    torch.cuda.synchronize()
+    assert torch.equal(args[2], reference)
+    assert torch.count_nonzero(locks) == 0

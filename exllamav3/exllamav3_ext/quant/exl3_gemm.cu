@@ -226,7 +226,10 @@ int exl3_gemm_gr
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
     // to the regular kernel.
-    if (mul1 && !size_n_out && exl3_gemv_int8_enabled())
+    // That experimental path owns a separate device-global workspace. A caller
+    // explicitly supplying isolated counters must stay on kernels whose only
+    // global scratch is the supplied activation/counter storage.
+    if (!owned_locks && mul1 && !size_n_out && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
