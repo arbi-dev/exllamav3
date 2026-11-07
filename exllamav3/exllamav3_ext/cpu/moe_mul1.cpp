@@ -1,3 +1,8 @@
+// x86 only: AVX2/AVX-512 intrinsics. On any other host (aarch64 SBSA: GH200,
+// GB200, GB10) the entry points below the #else are compiled instead and
+// refuse by name, and the capability probes report false, so callers take
+// their non-CPU paths.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
 #include "moe_mul1.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
@@ -2488,3 +2493,33 @@ void exl3_moe_cpu_forward
         static_cast<int>(num_threads)
     );
 }
+
+#else  // not x86
+
+#include <c10/util/Exception.h>
+#include "moe_mul1.h"
+
+#define EXL3_MOE_CPU_REFUSE TORCH_CHECK(false, "exllamav3: the CPU MoE path needs an x86_64 host with AVX2; this host is not x86")
+
+int64_t exl3_moe_cpu_make_layer
+(
+    const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+    const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+    const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+    const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+    int64_t, double, int64_t
+) { EXL3_MOE_CPU_REFUSE; return 0; }
+void exl3_moe_cpu_free_layer(int64_t) {}
+void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t)
+{ EXL3_MOE_CPU_REFUSE; }
+void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int)
+{ EXL3_MOE_CPU_REFUSE; }
+void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int) { EXL3_MOE_CPU_REFUSE; }
+void exl3_moe_cpu_set_prof(bool) {}
+int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { EXL3_MOE_CPU_REFUSE; return 0; }
+bool exl3_moe_cpu_has_avx2() { return false; }
+bool exl3_moe_cpu_has_avx512_bw() { return false; }
+bool exl3_moe_cpu_has_avx512_vnni() { return false; }
+bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+
+#endif  // x86

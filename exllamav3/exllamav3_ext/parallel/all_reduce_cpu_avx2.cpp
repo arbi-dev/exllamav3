@@ -1,3 +1,8 @@
+// x86 only: AVX2/AVX-512 intrinsics. On any other host (aarch64 SBSA: GH200,
+// GB200, GB10) the entry points below the #else are compiled instead and
+// refuse by name, and the capability probes report false, so callers take
+// their non-CPU paths.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
 #include <immintrin.h>
 #include "all_reduce_cpu_avx2.h"
 #include "all_reduce_cpu_avx512.h"
@@ -397,3 +402,25 @@ void perform_cpu_reduce_avx2
         chunk_idx++;
     }
 }
+
+#else  // not x86
+
+#include <c10/util/Exception.h>
+#include "all_reduce_cpu_avx2.h"
+
+void enable_fast_fp() {}
+
+void perform_cpu_reduce
+(
+    PGContext* ctx,
+    size_t data_size,
+    uint32_t device_mask,
+    uint32_t wire_dtype,
+    uint8_t* shbuf_ptr,
+    size_t shbuf_size
+)
+{
+    TORCH_CHECK(false, "exllamav3: the native CPU all-reduce needs an x86_64 host with AVX2; this host is not x86");
+}
+
+#endif  // x86
