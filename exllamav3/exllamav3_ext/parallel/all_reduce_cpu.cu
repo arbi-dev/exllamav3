@@ -109,7 +109,9 @@ void run_cpu_reduce_jobs
                 break;
             if (++spins < 65536)
             {
-                #ifdef __linux__
+                #if defined(__aarch64__)
+                    __asm__ __volatile__("yield");
+                #elif defined(__linux__)
                     __builtin_ia32_pause();
                 #else
                     _mm_pause();
