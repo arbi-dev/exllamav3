@@ -11,6 +11,10 @@ namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
 #include <map>
 
+// Parameter count of a kernel, for checking a cudaLaunch*Kernel argument array against it
+template <typename... Args>
+constexpr int exl3_kernel_arity(void (*)(Args...)) { return (int) sizeof...(Args); }
+
 /*
 QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
 exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl3_gemv entry
@@ -202,6 +206,7 @@ void exl3_gemv
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
+    int size_n_b = size_n;  // stored N: the plain GEMV entry has no column slicing
     int K = B.size(2) / 16;
 
     int cb = 0;
@@ -227,8 +232,14 @@ void exl3_gemv
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr
+        (void*)& svh_ptr,
+        (void*)& size_n_b
     };
+    // cudaLaunchCooperativeKernel reads one pointer per kernel parameter. A short array makes the
+    // driver dereference whatever follows it on the stack: garbage on some ABIs, a segfault on
+    // aarch64 (GB10). Keep the array in lockstep with EXL3_GEMM_ARGS
+    static_assert(sizeof(kernel_args) / sizeof(kernel_args[0]) == exl3_kernel_arity(exl3_gemv_kernel<4, false, 0, 0, 0, false>),
+                  "exl3_gemv: kernel_args does not match EXL3_GEMM_ARGS");
 
     bool ok = exl3_gemv_try_launch
     (
