@@ -15,15 +15,16 @@ EXT_DIR = ROOT / "exllamav3" / "exllamav3_ext"
 
 
 def test_lock_bound_covers_all_compiled_shapes(tmp_path):
-    compiler = shutil.which("g++") or shutil.which("clang++")
+    # exl3_kernel_map.cuh includes cuda_fp16.h and declares __host__ __device__ helpers, so the
+    # metadata is compiled as CUDA (host pass only, no device code is instantiated)
+    compiler = shutil.which("nvcc") or (shutil.which("/usr/local/cuda/bin/nvcc"))
     if compiler is None:
-        pytest.skip("needs a C++ compiler")
+        pytest.skip("needs nvcc")
     # Build actual metadata and the production sizing helper, with no CUDA or
     # extension load. Guard every supported TILESIZE_N, including future shapes.
-    source = tmp_path / "lock_bound.cpp"
+    source = tmp_path / "lock_bound.cu"
     source.write_text(r'''
 #include "quant/exl3_gemm_lock_size.h"
-struct half;  // metadata declares kernel pointer signatures; no CUDA types are used
 #include "quant/exl3_kernel_map.cuh"
 #include <initializer_list>
 constexpr bool covers_all_shapes() {
@@ -42,7 +43,8 @@ static_assert(covers_all_shapes());
 static_assert(exl3_gemm_lock_count(5120) * sizeof(int) == 160);
 static_assert(exl3_gemm_lock_count(248320) == 1940);
 ''')
-    subprocess.run([compiler, "-std=c++17", "-fsyntax-only", "-I", str(EXT_DIR), str(source)], check=True)
+    subprocess.run([compiler, "-std=c++17", "-c", "-I", str(EXT_DIR), str(source), "-o", str(tmp_path / "lock_bound.o")],
+                   check=True)
 
 
 @pytest.fixture(scope="module")

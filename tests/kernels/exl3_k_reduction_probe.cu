@@ -55,12 +55,14 @@ static int probe_gemm
     half* A_had_ptr = (half*) A_had.data_ptr();
     const half* svh_ptr = (const half*) svh.data_ptr();
     int* locks_ptr = (int*) locks.data_ptr();
+    int size_n_b = size_n;  // EXL3_GEMM_ARGS ends in the stored width; the array must cover every parameter
 
     void* kernelArgs[] =
     {
         (void*) &A_ptr, (void*) &B_ptr, (void*) &C_ptr,
         (void*) &size_m, (void*) &size_k, (void*) &size_n,
-        (void*) &locks_ptr, (void*) &suh_ptr, (void*) &A_had_ptr, (void*) &svh_ptr
+        (void*) &locks_ptr, (void*) &suh_ptr, (void*) &A_had_ptr, (void*) &svh_ptr,
+        (void*) &size_n_b
     };
 
     fp_exl3_gemm_kernel kernel = nullptr;
@@ -69,7 +71,7 @@ static int probe_gemm
     #define PROBE_CASE(_bits, _tk, _tn, _shs, _frs) \
         if (bits == _bits && tilesize_k == _tk) \
         { \
-            kernel = exl3_gemm_kernel<_bits, true, 0, 16, _tk, _tn, _shs, _frs>; \
+            kernel = exl3_gemm_kernel<_bits, false, true, 0, 16, _tk, _tn, _shs, _frs>; \
             tilesize_n = _tn; \
         }
     #define PROBE_BITS_CASE(_bits) PROBE_SHAPES(PROBE_CASE, _bits)
