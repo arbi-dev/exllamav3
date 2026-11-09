@@ -1,8 +1,4 @@
-// x86 only: AVX2/AVX-512 intrinsics. On any other host (aarch64 SBSA: GH200,
-// GB200, GB10) the entry points below the #else are compiled instead and
-// refuse by name, and the capability probes report false, so callers take
-// their non-CPU paths.
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #include "all_reduce_cpu_avx512.h"
 #include "all_reduce_cpu_avx2.h"
@@ -409,8 +405,13 @@ void perform_cpu_reduce_avx512
             }
         }
 
-        // Handle case where only one device contributed (no add needed, just copy)
-        if (first_src != nullptr && first_src != host_ptr(MAX_DEVICES, stage))
+        // No device contributed: the sum is zero (the slot still holds an earlier stage's result)
+        if (first_src == nullptr)
+        {
+            memset(host_ptr(MAX_DEVICES, stage), 0, stage_size);
+        }
+        // Only one device contributed (no add needed, just copy)
+        else if (first_src != host_ptr(MAX_DEVICES, stage))
         {
             memcpy(host_ptr(MAX_DEVICES, stage), first_src, stage_size);
         }
@@ -424,5 +425,4 @@ void perform_cpu_reduce_avx512
     }
 }
 
-#else  // not x86
-#endif  // x86
+#endif  // EXL3_AARCH64_STUB

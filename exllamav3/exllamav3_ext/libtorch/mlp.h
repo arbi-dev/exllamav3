@@ -26,7 +26,7 @@ struct BC_GatedMLP
     c10::optional<at::Tensor> gu_ptrs_trellis;
     c10::optional<at::Tensor> gu_ptrs_suh;
     c10::optional<at::Tensor> gu_ptrs_svh;
-    int gu_K;
+    float gu_K;
     bool gu_mcg;
     bool gu_mul1;
     bool act_silu;
@@ -45,10 +45,14 @@ struct BC_GatedMLP
     // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the
     // (2, MAX_BSZN, width) static buffer when num_tokens == MAX_BSZN (slicing dim 1 leaves dim
     // 0's stride at MAX_BSZN*width, not num_tokens*width, corrupting the slot-1 address for any
-    // other num_tokens). Lazily-allocated, exactly (2, num_tokens, width)-shaped buffers per
-    // num_tokens sidestep this -- same pattern as BC_BlockSparseMLP's flat_token_cache
-    std::vector<at::Tensor> guh_cache;
-    std::vector<at::Tensor> gu_cache;
+    // other num_tokens). Reshaping the static's leading 2*num_tokens*width elements instead gives
+    // the exact (2, num_tokens, width) layout without a per-layer allocation (the statics are
+    // shared by every layer on the device, these buffers are only live within one replay)
+    static at::Tensor slot_pair_view(const at::Tensor& t, int num_tokens)
+    {
+        int64_t width = t.size(2);
+        return t.view({-1}).narrow(0, 0, 2 * num_tokens * width).view({2, num_tokens, width});
+    }
 
     BC_GatedMLP
     (
@@ -59,7 +63,7 @@ struct BC_GatedMLP
         c10::optional<at::Tensor> _gu_ptrs_trellis,
         c10::optional<at::Tensor> _gu_ptrs_suh,
         c10::optional<at::Tensor> _gu_ptrs_svh,
-        int _gu_K,
+        float _gu_K,
         bool _gu_mcg,
         bool _gu_mul1,
         bool _act_silu,
@@ -89,8 +93,8 @@ struct BC_GatedMLP
         act_limit           (_act_limit)
     {
         TORCH_CHECK(gu_ptrs_trellis.has_value() || (gate && up), "BC_GatedMLP: need fused mgemm tensors or gate/up handles");
-        guh_cache.resize(MAX_BSZN);
-        gu_cache.resize(MAX_BSZN);
+        TORCH_CHECK(guh.is_contiguous() && gu.is_contiguous() && guh.size(1) == MAX_BSZN && gu.size(1) == MAX_BSZN,
+                    "BC_GatedMLP: guh/gu must be contiguous (2, MAX_BSZN, width) statics");
     }
 
     void run_bszN_gr

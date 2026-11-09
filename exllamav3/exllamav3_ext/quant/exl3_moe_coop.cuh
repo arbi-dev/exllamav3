@@ -104,7 +104,7 @@ struct MoeCoopParams
 // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
 // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
 // 1 mcg, 2 mul1 codebook, uniform across the three projections
-void exl3_moe_coop_launch(const MoeCoopParams& p, int K_gu, int K_d, int cb, int device, cudaStream_t stream);
+void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream);
 
 // Static part of the parameter block, validated once from the module's tensors (BC construction);
 // K_gu / K_d / cb come back through the out-params. Gate tables/scratch are ignored when
@@ -118,7 +118,7 @@ MoeCoopParams exl3_moe_coop_prepare
     const c10::optional<at::Tensor>& g_bias,
     const c10::optional<at::Tensor>& u_bias,
     const c10::optional<at::Tensor>& d_bias,
-    int Kg, int Ku, int Kd,
+    float Kg, float Ku, float Kd,
     bool mcg, bool mul1,
     int act,
     float act_limit,
@@ -132,13 +132,13 @@ MoeCoopParams exl3_moe_coop_prepare
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_gate_w,
-    int& K_gu, int& K_d, int& cb
+    float& K_gu, float& K_d, int& cb
 );
 
 // Per-call part: input rows, routing, optional shared-expert output (bsz rows, width H), launch
 void exl3_moe_coop_run
 (
-    MoeCoopParams p, int K_gu, int K_d, int cb,
+    MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out
 );
@@ -146,7 +146,7 @@ void exl3_moe_coop_run
 // Range-scaled variant of exl3_moe_coop_run (see MoeCoopParams: in_scale / act_scale / act_auto)
 void exl3_moe_coop_run_scaled
 (
-    MoeCoopParams p, int K_gu, int K_d, int cb,
+    MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out,
     const c10::optional<at::Tensor>& in_scale,
@@ -170,7 +170,7 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>& g_bias,
     const c10::optional<at::Tensor>& u_bias,
     const c10::optional<at::Tensor>& d_bias,
-    int Kg, int Ku, int Kd,
+    float Kg, float Ku, float Kd,
     bool mcg, bool mul1,
     int act,
     float act_limit,
@@ -211,7 +211,7 @@ void exl3_moe_coop_scaled
     const c10::optional<at::Tensor>& g_bias,
     const c10::optional<at::Tensor>& u_bias,
     const c10::optional<at::Tensor>& d_bias,
-    int Kg, int Ku, int Kd,
+    float Kg, float Ku, float Kd,
     bool mcg, bool mul1,
     int act,
     float act_limit,

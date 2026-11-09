@@ -41,10 +41,10 @@ class NemotronHMTPModel(Model):
 
         self.input_layer = Qwen3_5MTPInputLayer(
             config = config,
-            key = "mtp.layers.0.input",
-            key_pre_fc_norm_hidden = "mtp.layers.0.hnorm",
-            key_pre_fc_norm_embedding = "mtp.layers.0.enorm",
-            key_fc = "mtp.layers.0.eh_proj",
+            key = f"{config.tensor_prefix}mtp.layers.0.input",
+            key_pre_fc_norm_hidden = f"{config.tensor_prefix}mtp.layers.0.hnorm",
+            key_pre_fc_norm_embedding = f"{config.tensor_prefix}mtp.layers.0.enorm",
+            key_fc = f"{config.tensor_prefix}mtp.layers.0.eh_proj",
             hidden_size = config.hidden_size,
             rms_norm_eps = config.layer_norm_epsilon,
             native_draft_len = 1,
@@ -57,14 +57,14 @@ class NemotronHMTPModel(Model):
 
         for idx, block_type in enumerate(pattern):
             self.modules.append(nemotronh_block(
-                config, f"mtp.layers.{idx}", idx, block_type, qbits_key = "mtp_bits"
+                config, f"{config.tensor_prefix}mtp.layers.{idx}", idx, block_type, qbits_key = "mtp_bits"
             ))
 
         self.last_kv_module_idx = len(self.modules) - 1
 
         self.final_norm = RMSNorm(
             config = config,
-            key = f"mtp.layers.{len(pattern) - 1}.final_layernorm",
+            key = f"{config.tensor_prefix}mtp.layers.{len(pattern) - 1}.final_layernorm",
             rms_norm_eps = config.layer_norm_epsilon,
             out_dtype = torch.half,
         )
@@ -147,13 +147,5 @@ class NemotronHMTPModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        ll = self.attached_model().logit_layer_idx
-        lm = self.attached_model().modules[ll]
-        logits = lm.prepare_for_device(state, params)
-        logits = lm.forward(logits, params)
-        if params.get("export_draft_conf"):
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            conf, ids = torch.max(logits, dim = -1)
-            params["draft_conf"] = conf
-            return ids
-        return torch.argmax(logits, dim = -1)
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params)

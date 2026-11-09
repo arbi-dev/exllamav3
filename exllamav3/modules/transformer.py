@@ -2,9 +2,10 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..util.tensor import to2
+from ..util.device_copy import to_device
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
-from .hyperconnections import HyperConnection
+from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
 
 class TransformerBlock(Module):
@@ -134,6 +135,13 @@ class TransformerBlock(Module):
         )
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        # A deferred mHC apply_ (hyperconnections.hc_flush) lands before its streams move to another device
+        if "hc_pending" in params and x.device != self.device:
+            hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
     def forward(
         self,
         x: torch.Tensor,
@@ -146,17 +154,38 @@ class TransformerBlock(Module):
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
+        # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls sets
+        # resid_defer when the next module is a TransformerBlock on the same device)
+        pending = params.pop("resid_pending", None)
+        fuse_in = (
+            pending is not None and self.attn is not None and not self.attn_hc and
+            isinstance(self.attn_norm, RMSNorm) and self.attn_norm.can_fuse_residual(x, pending)
+        )
+        if pending is not None and not fuse_in:
+            x += pending
+
         if self.attn:
             if self.attn_hc:
-                hc_post, hc_comb, y = self.attn_hc.mix(x, params)
-                y = y.half()
-                if self.attn_norm:
+                hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
+                if self.attn_norm and not normed:
+                    # Normalize from the collapse's own precision (fp32 on the carry path, see
+                    # HyperConnection.mix_norm) rather than a half copy of it
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+                else:
+                    y = y.half()
+            elif fuse_in:
+                y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x)
             elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
-            y = self.attn.forward(y, params)
+            if self.attn.device != self.device:
+                # Attention pinned to the split's attention device (Model.load attn_device): its fp16
+                # input and output are what crosses, the residual streams stay here
+                y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
+                y = to_device(y, self.device)
+            else:
+                y = self.attn.forward(y, params)
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:
@@ -172,10 +201,13 @@ class TransformerBlock(Module):
 
         if self.mlp:
             if self.mlp_hc:
-                hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
-                y = y.half()
-                if self.mlp_norm:
+                hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm)
+                if self.mlp_norm and not normed:
+                    # Normalize from the collapse's own precision (fp32 on the carry path, see
+                    # HyperConnection.mix_norm) rather than a half copy of it
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
+                else:
+                    y = y.half()
             else:
                 params["residual"] = x
                 if y_resid is not None:
@@ -191,6 +223,12 @@ class TransformerBlock(Module):
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
+            elif (
+                params.get("resid_defer") and not export_state and self.layer_scalar_f is None and
+                (out_dtype or self.out_dtype) in (None, x.dtype)
+            ):
+                params["resid_pending"] = y
+                return x
             else:
                 x += y
 
@@ -340,7 +378,7 @@ class ParallelDecoderBlock(Module):
             y1 += y2
 
             if self.tp_reduce:
-                params["backend"].all_reduce(y1)
+                self.tp_collect(params["backend"], y1)
 
             x += y1
 
@@ -397,4 +435,6 @@ class ParallelDecoderBlock(Module):
 
         # Use single reduction for sum of mlp and attn
         module.tp_reduce = True
+        module.tp_owner = module.tp_single_owner(
+            local_context, exported["attn"]["kwargs"]["key"], exported["mlp"]["kwargs"]["key"])
         return module

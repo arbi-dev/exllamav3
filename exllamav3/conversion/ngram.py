@@ -28,7 +28,8 @@ import torch
 
 from ..modules.quant.exl3_lib.quantize import quantize_tiles
 from ..modules.quant.exl3_lib.ngram_codec import (  # noqa: F401  (re-exported)
-    ROW_DIM, MUL1, words_per_row, mul1_codebook, pack_rows, unpack_rows, dequant_rows,
+    ROW_DIM, GROUP_DIM, MUL1, words_per_row, mul1_codebook, pack_rows, unpack_rows, dequant_rows,
+    hadamard_rotate,
 )
 
 NGRAM_FORMAT_VERSION = 1
@@ -52,23 +53,25 @@ CS_SEARCH_STEP = 0.06
 
 def quantize_rows(
     rows: torch.Tensor,
-    bias: torch.Tensor,
+    bias: torch.Tensor | None,
     K: int,
     cs: float | None = None,
     cs_search: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    rows: (N, 160) source rows (any float dtype) on a CUDA device
-    bias: (N, 160) per-row bias to subtract (gathered per head), fp16 values
+    rows: (N, 160) source rows, or (N, 256) rotated groups (any float dtype) on a CUDA device
+    bias: (N, 160) per-row bias to subtract (gathered per head), fp16 values, or None
     cs: fixed codebook-scale multiplier, or None for the per-row heuristic (default)
     cs_search: number of encodes per row; > 1 sweeps cs in steps of CS_SEARCH_STEP centered on the
         heuristic/fixed value and keeps the lowest-error encode per row (decode-invisible)
-    Returns (packed (N, 1 + 10*K) int16, deq (N, 160) float reconstruction incl. bias).
+    Returns (packed (N, words) int16, deq float reconstruction incl. bias).
     """
     # Guard against corrupt source values: a single inf/NaN element would make every Viterbi cost
     # non-finite for its row (degenerate garbage output; before the kernel-side argmin clamp it
     # was an out-of-bounds access)
-    w = torch.nan_to_num(rows.float(), nan = 0.0, posinf = 0.0, neginf = 0.0) - bias.float()
+    w = torch.nan_to_num(rows.float(), nan = 0.0, posinf = 0.0, neginf = 0.0)
+    if bias is not None:
+        w = w - bias.float()
     rms = w.square().mean(dim = 1, keepdim = True).sqrt()
     if cs is None:
         gamma, cs_hi = CS_HEURISTIC[K]
@@ -103,8 +106,50 @@ def quantize_rows(
             best_scale = torch.where(better, scale, best_scale)
 
     packed = pack_rows(best_states, best_scale, K)
-    deq = best_q * best_scale.float().unsqueeze(1) + bias.float()
+    deq = best_q * best_scale.float().unsqueeze(1)
+    if bias is not None:
+        deq = deq + bias.float()
     return packed, deq
+
+
+def quantize_embedding(
+    key: str,
+    weight: torch.Tensor,
+    K: int,
+    device,
+    chunk_rows: int = 8192,
+    verbose: bool = True,
+) -> tuple[dict, float]:
+    """
+    Trellis quantization of a token embedding table: rows are zero-padded to a multiple of 256,
+    split into 256-wide groups and rotated (random signs + Hadamard), and each group is encoded
+    like an n-gram row. Returns the module's tensors and the relative error of the table:
+
+        <key>.trellis   (rows, groups * (1 + 16 * K)) int16, the groups' rings back to back
+        <key>.signs     (groups, 256) fp16 sign vectors
+    """
+    assert 1 <= K <= 8
+    rows, dim = weight.shape
+    groups = (dim + GROUP_DIM - 1) // GROUP_DIM
+    gen = torch.Generator().manual_seed(dim)
+    signs = (torch.randint(0, 2, (groups, GROUP_DIM), generator = gen) * 2 - 1).to(torch.float16)
+    signs_d = signs.to(device).float().view(1, -1)
+    trellis = torch.empty((rows, groups * words_per_row(K, GROUP_DIM)), dtype = torch.int16)
+    err_sq = src_sq = 0.0
+    from ..util.progress import ProgressBar
+    with ProgressBar(f" -- Quantizing: {key}" if verbose else None, rows) as pb:
+        for a in range(0, rows, chunk_rows):
+            w = weight[a : a + chunk_rows].to(device).float()
+            padded = torch.nn.functional.pad(w, (0, groups * GROUP_DIM - dim))
+            rotated = hadamard_rotate((padded * signs_d).view(-1, GROUP_DIM))
+            packed, deq = quantize_rows(rotated, None, K)
+            trellis[a : a + chunk_rows] = packed.view(w.shape[0], -1).cpu()
+            deq = (hadamard_rotate(deq).view(w.shape[0], -1) * signs_d)[:, :dim]
+            err_sq += (deq - w).square().sum().double().item()
+            src_sq += w.square().sum().double().item()
+            pb.update(a + w.shape[0])
+    rfn = math.sqrt(err_sq / src_sq) if src_sq > 0 else 0.0
+    return {f"{key}.trellis": trellis, f"{key}.signs": signs}, rfn
 
 
 class StreamingSafetensorsWriter:
@@ -253,6 +298,43 @@ class NgramSource:
         idx = torch.arange(start, end, device = device)
         h = torch.searchsorted(self.head_offsets.to(device), idx, right = True) - 1
         return h.clamp(0, self.num_heads - 1)
+
+
+def copy_tensors_streamed(stc, names: list[str], out_path: str, chunk: int = 256 << 20):
+    """Copy tensors from the checkpoint into one safetensors file without reading them into memory
+    whole (an Engram table is tens of GB). Skipped when the file already holds them at full size"""
+    entries = []
+    for name in names:
+        src = stc.tensor_file_map[name]
+        with open(src, "rb") as f:
+            hlen = struct.unpack("<Q", f.read(8))[0]
+            info = json.loads(f.read(hlen))[name]
+        a, b = info["data_offsets"]
+        entries.append((name, src, 8 + hlen + a, b - a, info["dtype"], info["shape"]))
+    total = sum(e[3] for e in entries)
+    header, off = {}, 0
+    for name, _, _, size, dtype, shape in entries:
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + size]}
+        off += size
+    hb = json.dumps(header).encode()
+    hb += b" " * ((8 - len(hb) % 8) % 8)
+    if os.path.exists(out_path) and os.path.getsize(out_path) == 8 + len(hb) + total:
+        print(f" -- N-gram table already in place: {out_path}")
+        return
+    bpw = 8 * total / max(sum(e[3] for e in entries if not e[0].endswith(".scale")), 1)
+    print(f" -- Copying n-gram table ({total >> 20} MiB) to {out_path}, kept as stored: {bpw:.2f} bpw")
+    with open(out_path + ".tmp", "wb") as out:
+        out.write(struct.pack("<Q", len(hb)))
+        out.write(hb)
+        for name, src, start, size, _, _ in entries:
+            with open(src, "rb") as f:
+                f.seek(start)
+                left = size
+                while left:
+                    buf = f.read(min(chunk, left))
+                    out.write(buf)
+                    left -= len(buf)
+    os.replace(out_path + ".tmp", out_path)
 
 
 def read_table_tensor(path: str, name: str, dtype: torch.dtype) -> torch.Tensor | None:
@@ -565,13 +647,28 @@ def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
     ngram_modules = [m for mod in model.modules for m in mod if isinstance(m, NGramEmbedding)]
     if not ngram_modules:
         return None
-    assert len(ngram_modules) == 1, "multiple n-gram tables not supported by the conversion step yet"
-    prefix = ngram_modules[0].key
 
     out_path = os.path.join(args["out_dir"], "ngram_embedding.safetensors")
     os.makedirs(args["out_dir"], exist_ok = True)
 
     ngram_file = args.get("ngram_file")
+    stc = config.stc
+    fixed = [m.key for m in ngram_modules
+             if not stc.has_tensor(f"{m.key}.shard_0.weight") and stc.has_tensor(f"{m.key}.weight")]
+    if not ngram_file and fixed:
+        # Fixed-width tables stored as one (fp8 + E8M0 scale) tensor each (DeepSeek-V4.1's Engram layers)
+        # have no trellis codec yet: they go into the output as they are, streamed file to file
+        assert len(fixed) == len(ngram_modules), "mixed n-gram table formats are not supported"
+        if args.get("ngram_bits"):
+            print(f" !! --ngram_bits ignored: {', '.join(fixed)} are fixed-width tables and are copied unquantized")
+        names = []
+        for prefix in fixed:
+            names += [f"{prefix}.weight"] + ([f"{prefix}.scale"] if stc.has_tensor(f"{prefix}.scale") else [])
+        copy_tensors_streamed(stc, names, out_path)
+        config.stc.add_tensor_files(out_path, warn_if_override = False)
+        return out_path
+    assert len(ngram_modules) == 1, "multiple n-gram tables not supported by the conversion step yet"
+    prefix = ngram_modules[0].key
     if ngram_file:
         with open(ngram_file, "rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]
