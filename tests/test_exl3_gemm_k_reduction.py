@@ -48,6 +48,12 @@ def _nvcc_available():
     return os.path.isfile(NVCC)
 
 
+def _torch_includes():
+    # util.cuh raises through c10 (TORCH_CHECK), so the guard TU needs torch's headers
+    from torch.utils.cpp_extension import include_paths
+    return [arg for path in include_paths() for arg in ("-isystem", path)]
+
+
 def _guard_arch():
     # The guard is a static_assert on template parameters, so any arch the kernel body itself
     # compiles for will do. cp.async in the pipeline needs sm_80 or later.
@@ -155,7 +161,7 @@ def test_tilesize_k_over_eight_must_be_power_of_two(tmp_path, tilesize_k, builda
     result = subprocess.run(
         [
             NVCC, "-std=c++20", f"-arch={_guard_arch()}", "-c",
-            "-I", EXT_DIR, f"-DPROBE_TILESIZE_K={tilesize_k}",
+            "-I", EXT_DIR, *_torch_includes(), f"-DPROBE_TILESIZE_K={tilesize_k}",
             os.path.join(KERNEL_DIR, "exl3_tilesize_k_guard.cu"),
             "-o", str(tmp_path / "guard.o"),
         ],
