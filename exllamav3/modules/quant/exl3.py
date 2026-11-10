@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch
 from ...model.config import Config
-from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
+from .exl3_lib.quantize import frac_k, preapply_had_l_, preapply_had_r_, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
@@ -228,7 +228,10 @@ class LinearEXL3:
         self.suh = suh if suh is not None else self.unpack_bf(su)
         self.svh = svh if svh is not None else self.unpack_bf(sv)
         self.trellis = trellis
-        self.K = trellis.shape[-1] // 16
+        # Bitrate from the tile width: 16 * K uint16 per tile, 16 * K + 8 for half-integer K (mul1 only)
+        K = trellis.shape[-1] / 16
+        self.K = int(K) if float(K).is_integer() else K
+        self.frac = frac_k(self.K)
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -240,9 +243,11 @@ class LinearEXL3:
         self.mul1_tensor = mul1
         self.mcg = self.mcg_tensor is not None
         self.mul1 = self.mul1_tensor is not None
+        assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
+        # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
             self.trellis,
             self.suh,
@@ -360,7 +365,7 @@ class LinearEXL3:
             if use_fused:
                 ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
             else:
-                ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+                self._reconstruct_inner(w, 0)
             ext.hgemm_recon(xh, w, y_)
         else:
             numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
@@ -373,7 +378,7 @@ class LinearEXL3:
                     ext.reconstruct_had_slice(
                         w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
                 else:
-                    ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+                    self._reconstruct_inner(w, n_start)
                 ext.hgemm_recon(xh, w, y_[:, n_start:n_end])
 
         if not use_fused:
@@ -384,9 +389,49 @@ class LinearEXL3:
         return y
 
 
+    def _reconstruct_inner(self, w: torch.Tensor, n_start: int):
+        """Rotated-basis weight slice (in_features, w.shape[1]) from packed columns n_start.."""
+        if n_start == 0 and w.shape[1] == self.out_features:
+            ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+        else:
+            ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+
+    def reconstruct_columns(self, cols: torch.Tensor, out: torch.Tensor, max_blocks: int = 64):
+        """
+        Original-basis weight columns (in_features, len(cols)) for the given column indices, written into out.
+        A column leaves the trellis only together with its 128-wide output Hadamard block, so the blocks holding
+        at least one requested column are reconstructed (rotated basis) into a stacked buffer, the Hadamards and
+        sign/scale vectors are applied to the stack as in get_weight_tensor, and the columns are gathered. Blocks
+        are processed in groups to bound the fp32 transient
+        """
+        k = self.in_features
+        order = torch.argsort(cols)
+        sorted_cols = cols[order]
+        blocks = torch.unique_consecutive(sorted_cols // 128)
+        block_list = blocks.tolist()
+        suh = self.suh.unsqueeze(1)
+        for g in range(0, len(block_list), max_blocks):
+            grp = block_list[g:g + max_blocks]
+            # The kernel writes a contiguous (k, 128) slab; the stack is re-laid as (k, blocks * 128) afterwards
+            stack = torch.empty((len(grp), k, 128), dtype = torch.half, device = self.trellis.device)
+            for bi, b in enumerate(grp):
+                ext.reconstruct_slice(stack[bi], self.trellis, self.K, self.mcg, self.mul1, b * 128)
+            w = stack.permute(1, 0, 2).reshape(k, 128 * len(grp))
+            w = preapply_had_l_(w, had_k)
+            w *= suh
+            w = preapply_had_r_(w, had_n)
+            svh_idx = (torch.tensor(grp, device = w.device).unsqueeze(1) * 128 + torch.arange(128, device = w.device)).view(-1)
+            w *= self.svh[svh_idx].unsqueeze(0)
+            # Requested columns inside this group: block index -> stacked offset
+            lo, hi = grp[0] * 128, (grp[-1] + 1) * 128
+            sel = ((sorted_cols >= lo) & (sorted_cols < hi)).nonzero().squeeze(1)
+            pos = torch.searchsorted(torch.tensor(grp, device = w.device), sorted_cols[sel] // 128) * 128 + sorted_cols[sel] % 128
+            out[:, order[sel]] = w[:, pos]
+
+
     def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None):
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+        self._reconstruct_inner(w, 0)
         return w
 
 
@@ -395,9 +440,9 @@ class LinearEXL3:
         suh = self.unpack_bf(self.su).unsqueeze(1) if self.su else self.suh.unsqueeze(1)
         svh = self.unpack_bf(self.sv).unsqueeze(0) if self.sv else self.svh.unsqueeze(0)
         w = self.get_inner_weight_tensor()
-        w = preapply_had_l(w, had_k)
+        w = preapply_had_l_(w, had_k)
         w *= suh
-        w = preapply_had_r(w, had_n)
+        w = preapply_had_r_(w, had_n)
         w *= svh
         # w *= self.scale
         return w

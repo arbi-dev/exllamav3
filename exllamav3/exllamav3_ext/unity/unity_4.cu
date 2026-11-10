@@ -59,11 +59,11 @@
 #include "../histogram.cu"
 #pragma pop_macro("MAX_BINS")
 #pragma pop_macro("NUM_THREADS")
+#pragma push_macro("MAX_RING_DIM")
 #pragma push_macro("MUL1")
-#pragma push_macro("ROW_DIM")
 #include "../ngram.cu"
+#pragma pop_macro("MAX_RING_DIM")
 #pragma pop_macro("MUL1")
-#pragma pop_macro("ROW_DIM")
 #pragma push_macro("NUM_THREADS")
 #pragma push_macro("RES_IN")
 #pragma push_macro("RES_NONE")

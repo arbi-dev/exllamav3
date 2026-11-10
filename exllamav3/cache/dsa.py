@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 from ..constants import PAGE_SIZE
 from .cache import Cache, CacheLayer
-from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash
+from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash, host_copy
 
 """
 Cache state for DSA (DeepSeek-V4-style hybrid sparse attention) layers, split along the
@@ -81,7 +81,7 @@ class CacheLayer_dsa(CacheLayer):
         D_r = attention.rope_head_dim
         self.D_c = D - D_r
         self.D_r = D_r
-        self.D_i = attention.index_head_dim if attention.layer_type == "csa" else 0
+        self.D_i = attention.index_head_dim if getattr(attention, "indexer_mode", None) == "full" else 0
         if k_bits:
             assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
             assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
@@ -198,6 +198,8 @@ class DSV4ExportedState:
     serial: int
     wshift: int = 0
     last_history: int = 0
+    # Marks the handle a TP worker holds, for modules that look their layer state up by cache id (PLE)
+    exported = True
 
 
 class DSV4State:
@@ -244,6 +246,10 @@ class DSV4State:
     def rewind(self, num_tokens: int):
         assert num_tokens <= self.rollback_capacity(), \
             f"DSV4State: rewind {num_tokens} exceeds capacity {self.rollback_capacity()}"
+        # The DSA layers derive everything from the position; other layer states sharing the
+        # state (V4.1's Engram id context) keep a history window the way the generic states do
+        for l in self.cache.get_all_recurrent_layers().values():
+            l.rewind(self.slot, self.last_history, num_tokens)
         self.position -= num_tokens
         self.last_history = 0
 
@@ -331,7 +337,7 @@ class DSV4LayerState:
         self.idx_buf_kv = self.idx_buf_gate = None
         self.comp_ovl = self.idx_ovl = None
 
-        if self.layer_type in ("csa", "hca"):
+        if module.compressor is not None:
             m = module.compress_rate
             w = module.compressor.wkv.out_features_unpadded
             self.buf_rows = PAGE_SIZE + m
@@ -367,12 +373,9 @@ class DSV4LayerState:
 
 
     def get_checkpoint_size(self):
-        # Window slice + buffers + overlaps (upper bound; the ring slice shrinks below the
-        # window at low positions). Pools are paged cache state and not part of checkpoints
-        n = self.window * self.module.head_dim * 2
-        for t in self._tensors()[1:]:
-            n += t[0].numel() * t.element_size()
-        return n
+        # Ring slice + buffers + overlaps (upper bound; stash() copies up to ring_rows rows of
+        # the ring, fewer at low positions). Pools are paged cache state and not part of checkpoints
+        return sum(t[0].numel() * t.element_size() for t in self._tensors())
 
 
     def storage_size(self):
@@ -399,14 +402,14 @@ class DSV4LayerState:
 
 
     def stash(self, slot, position):
-        out = [self.ring[slot, :min(self.ring_rows, position)].cpu()]
+        out = [host_copy(self.ring[slot, :min(self.ring_rows, position)])]
         if self.comp_buf_kv is not None:
-            out.append(self.comp_buf_kv[slot].cpu())
-            out.append(self.comp_buf_gate[slot].cpu())
+            out.append(host_copy(self.comp_buf_kv[slot]))
+            out.append(host_copy(self.comp_buf_gate[slot]))
             if self.idx_buf_kv is not None:
-                out.append(self.idx_buf_kv[slot].cpu())
-                out.append(self.idx_buf_gate[slot].cpu())
-                out.append(self.comp_ovl[slot].cpu())
+                out.append(host_copy(self.idx_buf_kv[slot]))
+                out.append(host_copy(self.idx_buf_gate[slot]))
+                out.append(host_copy(self.comp_ovl[slot]))
                 out.append(self.idx_ovl[slot].cpu())
         return out
 

@@ -6,7 +6,9 @@ from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
+from .deepseek_v41 import DeepseekV41Model
 from .dflash import DFlashModel
+from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
@@ -15,6 +17,7 @@ from .exaone4 import Exaone4Model
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
 from .gemma4 import Gemma4TextModel, Gemma4UnifiedTextModel
+from .gemma4_assistant import Gemma4AssistantModel
 from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
@@ -27,11 +30,17 @@ from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .kimi_linear import KimiLinearModel
+from .bailing_hybrid import BailingHybridModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
+from .lfm2_vl import Lfm2VlTextModel
+from .lfm3 import Lfm3Model
+from .lfm3_vl import Lfm3VlTextModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
+from .mimo_v2 import MiMoV2Model
 from .minimax_m2 import MiniMaxM2Model
 from .ministral3 import Ministral3Model
 from .mistral import MistralModel
@@ -39,7 +48,7 @@ from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .muse_glimmer import MuseGlimmerTextModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantModel
-from .nemotronh import NemotronHModel
+from .nemotronh import NemotronHModel, NemotronHOmniModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -73,7 +82,9 @@ ARCHITECTURES = {
         DeciLMModel,
         DeepseekV3Model,
         DeepseekV4Model,
+        DeepseekV41Model,
         DFlashModel,
+        DFlash2Model,
         DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
@@ -83,6 +94,7 @@ ARCHITECTURES = {
         Gemma3Model,
         Gemma3TextModel,
         Gemma4TextModel,
+        Gemma4AssistantModel,
         Gemma4UnifiedTextModel,
         Glm4Model,
         Glm4MoeModel,
@@ -91,6 +103,8 @@ ARCHITECTURES = {
         Glm4MoeLiteModel,
         GlmMoeDsaModel,
         Glm5NextModel,
+        KimiLinearModel,
+        BailingHybridModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
@@ -99,8 +113,12 @@ ARCHITECTURES = {
         LagunaModel,
         Lfm2Model,
         Lfm2MoeModel,
+        Lfm2VlTextModel,
+        Lfm3Model,
+        Lfm3VlTextModel,
         LlamaModel,
         MiMoModel,
+        MiMoV2Model,
         MiniMaxM2Model,
         Ministral3Model,
         MistralModel,
@@ -109,6 +127,7 @@ ARCHITECTURES = {
         MuseGlimmerTextModel,
         MuseGlimmerAssistantModel,
         NemotronHModel,
+        NemotronHOmniModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,

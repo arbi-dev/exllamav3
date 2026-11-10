@@ -1,9 +1,24 @@
 #pragma once
 
+// The GEMM / multi-GEMM wrappers (slab loop, input Hadamard, grid barriers) and the shape table
+// (exl3_kernel_map.cuh) are shared; the backend supplies the tile inner: tensor-core MMA with cp.async
+// pipelines (CUDA) or WMMA on RDNA (rocm/quant)
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
-#include "exl3_gemm_inner.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_gemm_inner_rdna.cuh"
+#else
+    #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
+
+// Whole-grid barrier. On ROCm the kernels are plain launches (EXL3_COOP_LAUNCH, coop_autotune.cuh) and sync
+// through a device counter; every block is resident (the grid is at most one block per multiprocessor)
+#if defined(USE_ROCM)
+    #define EXL3_GRID_SYNC() group_barrier(0, gridDim.x * gridDim.y * gridDim.z, locks + EXL3_GRID_BARRIER_OFFSET)
+#else
+    #define EXL3_GRID_SYNC() grid.sync()
+#endif
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -26,7 +41,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
 
-        grid.sync();
+        EXL3_GRID_SYNC();
         A = A_had;
     }
 
@@ -37,8 +52,13 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+    #if defined(USE_ROCM)
+        // The RDNA inner has no stored-width pitch; the host refuses size_n_b != size_n there
+        (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, locks, svh);
+    #else
         (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, locks, svh, 0, size_n_b);
+    #endif
 
         A_ += TILESIZE_M * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * size_n);
@@ -51,9 +71,14 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         // the LAST tile -- the output Hadamard and svh scale are applied to each
         // finished tile inside the mainloop (exl3_gemm_inner.cuh, shmem_out_had,
         // which this kernel instantiates true) -- so the barrier is a function of
-        // the tile count alone and not of whether an output scale is present.
-        if (size_m_ > 0)
-            grid.sync();
+        // the tile count alone and not of whether an output scale is present. The RDNA inner
+        // (rocm/quant) keeps upstream's barrier after an svh tile.
+        #if defined(USE_ROCM)
+            if (size_m_ > 0 || svh)
+        #else
+            if (size_m_ > 0)
+        #endif
+            EXL3_GRID_SYNC();
     }
 
     // if (svh)
@@ -94,7 +119,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     auto grid = cg::this_grid();
 
     int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
-    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+    #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
         constexpr bool group_sync = true;
     #else
         const bool group_sync = locks[MGEMM_FLAGS_OFFSET] != 0;   // grid-uniform
@@ -137,7 +162,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             if (lane == 0) chunk_count[chunk] = count;
         }
         __threadfence();
-        grid.sync();
+        EXL3_GRID_SYNC();
 
         if (chunk < num_chunks && threadIdx.x < 32)
         {
@@ -159,7 +184,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             if (chunk == 0 && lane == 0) slot_total[0] = total;
         }
         __threadfence();
-        grid.sync();
+        EXL3_GRID_SYNC();
         num_slots = slot_total[0];
     }
 
@@ -183,7 +208,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
         }
-        grid.sync();
+        EXL3_GRID_SYNC();
     }
 
     for (int i = 0; i < num_slots; i += gridDim.z)
@@ -225,7 +250,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         }
 
         if (group_sync) group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
-        else grid.sync();
+        else EXL3_GRID_SYNC();
 
         // Matmul. Per-matrix output width/pointer when the caller supplies the lists
         // (size_n then only sizes the per-z-slice lock ranges and must be the max width);
@@ -235,7 +260,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         // Column slices write into a wider row (their source matrix's full width)
         int n_stride_j = (n_stride_list && mat_index >= 0) ? n_stride_list[mat_index] : n_j;
         int size_m_ = size_m;
-        half* A_ = A_had + (had_src_list ? had_src_list[mat_index] : j) * size_m * size_k;
+        // Idle z-slots carry mat_index -1 and never touch A_; guard the table read anyway
+        half* A_ = A_had + ((had_src_list && mat_index >= 0) ? had_src_list[mat_index] : j) * size_m * size_k;
         void* C_;
         if (C_list && mat_index >= 0) C_ = C_list[mat_index];
         else if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
@@ -249,7 +275,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 int lock_offs = blockIdx.z * size_n / 128;
 
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
                 (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
             }
 
@@ -259,7 +285,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             size_m_ -= TILESIZE_M;
 
             if (group_sync) group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
-            else grid.sync();
+            else EXL3_GRID_SYNC();
         }
 
         // Had and output scales
@@ -303,7 +329,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     }
 
     if (B_weights)
-        grid.sync();
+        EXL3_GRID_SYNC();
 
     // Final reduction: each of the num_tokens groups of (bszm / num_tokens) contiguous slots is
     // summed into its own output row (row t for group t), instead of always collapsing into row

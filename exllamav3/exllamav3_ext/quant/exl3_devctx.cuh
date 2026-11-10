@@ -2,6 +2,7 @@
 
 #include <tuple>
 #include <mutex>
+#include "../arch.cuh"
 
 // Max allowable output size, in tiles. Used to allocate global lock buffer per device for sync across threadblocks
 #define MAX_TILES_C (1024 * 1024)
@@ -30,6 +31,14 @@
 #define MGEMM_FLAGS_OFFSET (MGEMM_SLOTS_OFFSET + MGEMM_SLOTS_INTS)
 #define MGEMM_FLAGS_INTS 1
 
+#if defined(USE_ROCM)
+    // Whole-grid barrier of the EXL3 GEMM kernels (counter + sense), which ROCm launches without the
+    // cooperative launch (see EXL3_COOP_LAUNCH in coop_autotune.cuh). After the mgemm slot list and
+    // flags, which upstream does not have, so the two never alias
+    #define EXL3_GRID_BARRIER_OFFSET (MGEMM_FLAGS_OFFSET + MGEMM_FLAGS_INTS)
+    #define EXL3_GRID_BARRIER_INTS 2
+#endif
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 
@@ -46,6 +55,7 @@ class DevCtx
 private:
     int num_sms[MAX_DEVICES] = {};
     int cc[MAX_DEVICES] = {};
+    int smem_max[MAX_DEVICES] = {};
     void* locks[MAX_DEVICES] = {};
     void* ws[MAX_DEVICES] = {};
     std::mutex mtx;
@@ -54,6 +64,12 @@ public:
     static DevCtx& instance();
     int get_num_sms(int device);
     int get_cc(int device);
+    // Device capability: dynamic shared memory per block the driver will grant, unclamped
+    // (sm_86 reports 99 KB, Turing 64 KB). Use this to decide what a device can do.
+    int get_smem_max(int device);
+    // What an EXL3 kernel may actually request: the above, capped at the SMEM_MAX the kernels
+    // are written against. Use this for cudaFuncSetAttribute and launch parameters.
+    int get_smem_request(int device);
     void* get_ws(int device);
     int* get_locks(int device);
 
@@ -65,5 +81,6 @@ private:
 
 int g_get_cc(int device);
 int g_get_num_sms(int device);
+int g_get_smem_max(int device);
 
 void prepare_ctx(int device);

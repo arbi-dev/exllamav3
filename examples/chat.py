@@ -89,9 +89,14 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
+        hybrid_draft_tokens = args.hybrid_draft_tokens,
+        ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
+        sparse_draft_head = args.sparse_draft_head,
         draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        disk_cache_dir = args.disk_cache_dir,
+        disk_cache_size = int(args.disk_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
         show_visualizer = args.visualize_cache,
         max_chunk_size = args.generator_chunk_size,
@@ -251,6 +256,9 @@ def main(args):
 
                 # Edit last response
                 case "/e":
+                    if len(context) == 0:
+                        print_error(f"Context is empty, nothing to edit")
+                        continue
                     print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
@@ -475,7 +483,7 @@ def main(args):
             frm_context = prompt_format.format(system_prompt, context, think)
             if _prefix:
                 frm_context += prefix
-            elif think and prompt_format.thinktag()[0] is not None:
+            elif think and prompt_format.thinktag()[0] is not None and prompt_format.inject_thinktag():
                 frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
@@ -516,7 +524,7 @@ def main(args):
             banned_strings = banned_strings,
             token_healing = enable_healing,
             return_logits = save_probs > 0,
-            stop_on_loop = (args.loop_window, args.loop_min_reps),
+            stop_on_loop = True,
             identifier = n,
         ) for n in range(num_completions)]
         generator.enqueue(jobs)
@@ -658,8 +666,6 @@ if __name__ == "__main__":
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
-    parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
-    parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     _args = parser.parse_args()

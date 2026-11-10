@@ -23,12 +23,13 @@ SHAPES = {
     7: (32, 16, 128),
     8: (48, 16, 128),
     9: (64, 16, 128),
-    10: (32, 16, 512),
+    10: (80, 16, 128),
+    11: (96, 16, 128),
 }
 
 # A multi-row-block shape and the 16-row shape it is a pure restriping of: same TILESIZE_K
 # (same sub-k reduction) and same TILESIZE_N (same warp-to-column assignment)
-IDENTICAL_PAIRS = [(5, 2), (7, 1), (8, 1), (9, 1), (10, 4)]
+IDENTICAL_PAIRS = [(5, 2), (7, 1), (8, 1), (9, 1), (10, 1), (11, 1)]
 
 # Shape 6 (32, 16, 256) has no 16-row partner: the table holds no (16, 16, 256), and the
 # natural M=32 twin of shape 3 -- (32, 32, 256) -- spills past the 128-register cap that

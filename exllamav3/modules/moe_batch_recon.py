@@ -27,6 +27,7 @@ import os
 import numpy as np
 import torch
 from ..ext import exllamav3_ext as ext
+from ..util.device_copy import host_to_device
 
 RECON_BATCH = max(1, int(os.environ.get("EXL3_MOE_RECON_BATCH", 16)))
 # Padded rows per group (B * cmax): bounds the gathered input / intermediate slabs
@@ -36,11 +37,14 @@ RECON_MB = max(1, int(os.environ.get("EXL3_MOE_RECON_MB", 256)))
 # Folded reconstruct (suh / Hadamard / svh applied to the dequantized weights, the dense
 # Linear prefill formulation) vs Hadamards on the activation slabs. Default on
 RECON_FOLDED = os.environ.get("EXL3_MOE_RECON_FOLDED", "1") != "0"
-# Batching pays while a single expert's GEMM cannot fill the GPU: with 128x128 output tiles an
-# m x n GEMM launches ceil(m/128) * ceil(n/128) blocks, and below roughly the SM count the
-# strided-batched kernel wins by a wide margin. EXL3_MOE_RECON_TILES sets the budget
-# (0 = batch everything); EXL3_MOE_RECON_MAX_ROWS caps rows directly
-RECON_TILES = int(os.environ.get("EXL3_MOE_RECON_TILES", 64))
+# The batched tier takes every expert up to the padded-rows budget (RECON_ROWS): its one-launch
+# reconstruct and the library GEMM over the slab beat the per-expert reconstruct path (one
+# dequant + three GEMMs + a gather and a scatter per expert) at every row count, large experts
+# included, so the tier is no longer limited to experts whose GEMM could not fill the GPU on
+# its own. EXL3_MOE_RECON_TILES restores that limit (ceil(m/128) * ceil(n/128) output tiles per
+# expert GEMM, as a budget); EXL3_MOE_RECON_MAX_ROWS caps rows directly. Both stay within
+# RECON_ROWS, which the autosplit worst-case measure assumes for a single group
+RECON_TILES = int(os.environ.get("EXL3_MOE_RECON_TILES", 0))
 RECON_MAX_ROWS = int(os.environ.get("EXL3_MOE_RECON_MAX_ROWS", 0))
 # Give up on adding a smaller expert to a group once padded rows would exceed this multiple of
 # the real rows: a group of very uneven experts wastes GEMM work on zeros.
@@ -107,6 +111,40 @@ def batch_cap(dims_g, dims_u, dims_d):
     return max(1, min(RECON_BATCH, (RECON_MB << 20) // per))
 
 
+def max_group_rows(dims_u, dims_d):
+    """Row cap for an expert to join the batched tier (see RECON_TILES / RECON_MAX_ROWS)"""
+    if RECON_MAX_ROWS > 0:
+        return min(RECON_MAX_ROWS, RECON_ROWS)
+    if RECON_TILES > 0:
+        n_min = min(dims_u[1], dims_d[1])
+        return max(128, min(RECON_ROWS, (RECON_TILES * 128 * 128) // n_min))
+    return RECON_ROWS
+
+
+def worst_case_bytes(dims_g, dims_u, dims_d, interm_fp32: bool, assignments: int,
+                     slot_mode: bool) -> int:
+    """Upper bound on one group's per-call temporaries (weight slabs, gathered input,
+    gate / up slabs, activation, and the fp32 down slab unless it lands in the caller's slot
+    scratch) for `assignments` routed rows in total: the autosplit loader's worst-case
+    measure. Group rows are bounded by the batch cap, the row cap and the padding budget.
+    Depends on the projection shapes only, so the TP allocator can take it before load"""
+    ku, nu = dims_u[0], dims_u[1]
+    kd, nd = dims_d[0], dims_d[1]
+    kg, ng = (dims_g[0], dims_g[1]) if dims_g else (0, 0)
+    cap = batch_cap(dims_g, dims_u, dims_d)
+    cmax = min(max_group_rows(dims_u, dims_d), assignments)
+    rows = min(cap * cmax, RECON_ROWS, int(assignments * PAD_MAX) + cmax)
+    total = 2 * cap * (max(kg * ng, kd * nd) + ku * nu)              # scratch1 + Wu
+    total += rows * ku * 2                                           # gathered input
+    idt = 4 if interm_fp32 else 2
+    total += rows * nu * idt * (2 if dims_g else 1)                  # u (+ g)
+    if interm_fp32:
+        total += rows * nu * 2                                       # fp16 activation
+    if not slot_mode:
+        total += rows * nd * 4                                       # down slab
+    return total
+
+
 class BatchReconLayer:
     """Per-layer constants for the batched path: projection dims, codebook flags, activation,
     and the stacked per-expert sign vectors. Trellis pointer tables are supplied per call (they
@@ -125,13 +163,7 @@ class BatchReconLayer:
         self.act_limit = float(act_limit or 0.0)
         self.device = device
         self.cap = batch_cap(dims_g, dims_u, dims_d)
-        if RECON_MAX_ROWS > 0:
-            self.max_rows = RECON_MAX_ROWS
-        elif RECON_TILES > 0:
-            n_min = min(dims_u[1], dims_d[1])
-            self.max_rows = max(128, (RECON_TILES * 128 * 128) // n_min)
-        else:
-            self.max_rows = 1 << 30
+        self.max_rows = max_group_rows(dims_u, dims_d)
         # Static per-expert trellis pointer tables ([E] int64, device) when the experts are
         # resident: the per-group tables are then a device-side gather by expert id instead of
         # a host-built list. Streamed experts (VRAM slot addresses) pass pointers per call.
@@ -155,24 +187,8 @@ class BatchReconLayer:
                 self.scales[p] = (_stacked(suh), _stacked(svh))
 
     def worst_case_bytes(self, assignments: int, slot_mode: bool) -> int:
-        """Upper bound on one group's per-call temporaries (weight slabs, gathered input,
-        gate / up slabs, activation, and the fp32 down slab unless it lands in the caller's slot
-        scratch) for `assignments` routed rows in total: the autosplit loader's worst-case
-        measure. Group rows are bounded by the batch cap, the row cap and the padding budget"""
-        ku, nu, _ = self.dims_u
-        kd, nd, _ = self.dims_d
-        kg, ng = (self.dims_g[0], self.dims_g[1]) if self.gated else (0, 0)
-        cmax = min(self.max_rows, assignments)
-        rows = min(self.cap * cmax, RECON_ROWS, int(assignments * PAD_MAX) + cmax)
-        total = 2 * self.cap * (max(kg * ng, kd * nd) + ku * nu)        # scratch1 + Wu
-        total += rows * ku * 2                                           # gathered input
-        idt = 4 if self.interm_fp32 else 2
-        total += rows * nu * idt * (2 if self.gated else 1)              # u (+ g)
-        if self.interm_fp32:
-            total += rows * nu * 2                                       # fp16 activation
-        if not slot_mode:
-            total += rows * nd * 4                                       # down slab
-        return total
+        return worst_case_bytes(self.dims_g, self.dims_u, self.dims_d, self.interm_fp32, assignments,
+                                slot_mode)
 
     def _linear(self, x, W, p, ids, out_n, out_dtype = torch.half, out = None):
         """x: [B, cmax, k] input slab, W: [B, k, n] -> [B, cmax, n]. Unfolded: the same
@@ -240,7 +256,7 @@ class BatchReconLayer:
             for i, pl in enumerate(ptrs):
                 if pl is not None:
                     meta_h[3 + i] = pl
-        meta = torch.from_numpy(meta_h).to(dev, non_blocking = True)
+        meta = host_to_device(torch.from_numpy(meta_h), dev)
         ids_d = meta[0]
         if ptrs is not None:
             ptr_g, ptr_u, ptr_d = meta[3], meta[4], meta[5]
