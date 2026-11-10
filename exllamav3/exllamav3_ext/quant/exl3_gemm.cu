@@ -72,7 +72,9 @@ uint64_t gemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) (half_k ? 1 : 0));
+    // Half-integer rates tune separately. Mixed in only for them, so every integer-rate key is the one
+    // the fork computed before the merge and a persisted tune table (EXLLAMAV3_TUNE_CACHE) stays valid
+    if (half_k) mix(1ull);
     // Bucket by 16-row MMA blocks. Every TILESIZE_M is a multiple of 16, so two batch sizes
     // with the same block count run the same number of strips in every candidate shape and
     // rank the same. Rounding to a power of two instead merges batch sizes whose best shape
